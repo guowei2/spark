@@ -286,8 +286,8 @@ class HiveContext(sc: SparkContext) extends SQLContext(sc) {
   def hiveconf = sessionState.getConf
 
   override def setConf(key: String, value: String): Unit = {
-    super.setConf(key, value)
     runSqlHive(s"SET $key=$value")
+    super.setConf(key, value)
   }
 
   /* A catalyst metadata catalog that points to the Hive Metastore. */
@@ -335,7 +335,9 @@ class HiveContext(sc: SparkContext) extends SQLContext(sc) {
       val cmd_1: String = cmd_trimmed.substring(tokens(0).length()).trim()
       val proc: CommandProcessor = HiveShim.getCommandProcessor(Array(tokens(0)), hiveconf)
 
-      SessionState.start(sessionState)
+      if (SessionState.get() != sessionState) {
+        SessionState.start(sessionState)
+      }
 
       proc match {
         case driver: Driver =>
