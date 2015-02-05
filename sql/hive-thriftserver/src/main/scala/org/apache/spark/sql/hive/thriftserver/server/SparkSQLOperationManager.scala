@@ -26,6 +26,7 @@ import org.apache.hive.service.cli.session.HiveSession
 import org.apache.spark.Logging
 import org.apache.spark.sql.hive.HiveContext
 import org.apache.spark.sql.hive.thriftserver.{SparkExecuteStatementOperation, ReflectionUtils}
+import org.apache.hadoop.hive.ql.session.SessionState
 
 /**
  * Executes queries using Spark SQL, and maintains a list of handles to active queries.
@@ -47,7 +48,7 @@ private[thriftserver] class SparkSQLOperationManager(hiveContext: HiveContext)
     val operation = new SparkExecuteStatementOperation(parentSession, statement, confOverlay)(
       hiveContext, sessionToActivePool)
     handleToOperation.put(operation.getHandle, operation)
-    hiveContext.currentSessionState.set(parentSession.getSessionState)
+    SessionState.setCurrentSessionState(parentSession.getSessionState)
     operation
   }
 }
