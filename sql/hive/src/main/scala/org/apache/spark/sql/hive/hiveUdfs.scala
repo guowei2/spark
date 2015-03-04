@@ -375,8 +375,7 @@ private[hive] case class HiveUdafFunction(
 
   private val returnInspector = function.init(GenericUDAFEvaluator.Mode.COMPLETE, inspectors)
 
-  private val buffer =
-    function.getNewAggregationBuffer
+  private val buffer = function.getNewAggregationBuffer
 
   override def eval(input: Row): Any = unwrap(function.evaluate(buffer), returnInspector)
 
