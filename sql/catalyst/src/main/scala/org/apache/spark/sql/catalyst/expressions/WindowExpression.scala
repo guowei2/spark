@@ -22,15 +22,10 @@ import org.apache.spark.sql.catalyst.analysis.UnresolvedAttribute
 
 
 /**
- *
  * @param child the computation being performed
  * @param windowSpec the window spec definition
- * @param exprId A globally unique id used to check if an [[AttributeReference]] refers to this
- *               alias. Auto-assigned if left blank.
  */
-case class WindowExpression(child: Expression, name: String, windowSpec: WindowSpec)
-    (val exprId: ExprId = NamedExpression.newExprId, val qualifiers: Seq[String] = Nil)
-  extends NamedExpression with trees.UnaryNode[Expression] {
+case class WindowExpression(child: Expression, windowSpec: WindowSpec) extends UnaryExpression {
 
   override type EvaluatedType = Any
 
@@ -38,18 +33,9 @@ case class WindowExpression(child: Expression, name: String, windowSpec: WindowS
 
   override def dataType = child.dataType
   override def nullable = child.nullable
+  override def foldable = child.foldable
 
-  override def toAttribute = {
-    if (resolved) {
-      AttributeReference(name, child.dataType, child.nullable)(exprId, qualifiers)
-    } else {
-      UnresolvedAttribute(name)
-    }
-  }
-
-  override def toString: String = s"$child $windowSpec AS $name#${exprId.id}$typeSuffix"
-
-  override protected final def otherCopyArgs = exprId :: qualifiers :: Nil
+  override def toString: String = s"$child $windowSpec"
 }
 
 case class WindowSpec(windowPartition: WindowPartition, windowFrame: Option[WindowFrame])
@@ -57,7 +43,8 @@ case class WindowSpec(windowPartition: WindowPartition, windowFrame: Option[Wind
 case class WindowPartition(partitionBy: Seq[Expression], sortBy: Seq[SortOrder])
 
 sealed trait FrameType
-case object ValueFrame extends FrameType
-case object RowsFrame extends FrameType
+
+case object RowFrame extends FrameType
+case object RangeFrame extends FrameType
 
 case class WindowFrame(frameType: FrameType, preceding: Int, following: Int)

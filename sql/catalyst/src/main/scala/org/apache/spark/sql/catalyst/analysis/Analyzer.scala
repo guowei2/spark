@@ -427,15 +427,14 @@ class Analyzer(
   }
 
   /**
-   * translate WindowAttribute in SelectExpression to attribute
+   * transform the computed WindowExpression to attribute, such as in Project
    */
   object WindowAttributes extends Rule[LogicalPlan] {
     def apply(plan: LogicalPlan): LogicalPlan = plan transform {
       case q: WindowAggregate => q
       case q: LogicalPlan =>
         q transformExpressions {
-          // translate WindowAttribute in SelectExpression to attribute
-          case u @ WindowExpression(children, name, windowSpec) => u.toAttribute
+          case u @ Alias(WindowExpression(children, windowSpec), name) => u.toAttribute
         }
     }
   }

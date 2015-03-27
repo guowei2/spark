@@ -1089,8 +1089,7 @@ https://cwiki.apache.org/confluence/display/Hive/Enhanced+Aggregation%2C+Cube%2C
           .map(_.asInstanceOf[ASTNode] :: frame)
           .getOrElse(frame)
 
-      case e =>
-        e
+      case e => e
     }
   }
 
@@ -1101,17 +1100,24 @@ https://cwiki.apache.org/confluence/display/Hive/Enhanced+Aggregation%2C+Cube%2C
   protected def windowToPlan(
       selectExpressions: Seq[NamedExpression],
       withLateralView: LogicalPlan): LogicalPlan = {
-    val windowExpressions = selectExpressions.flatMap(_.collect { case a: WindowExpression => a })
+
+    val windowExpressions =
+      selectExpressions.flatMap(_.collect { case a @ Alias(WindowExpression(_, _), _) => a })
+
     val attributes = selectExpressions.flatMap(_.collect {
       case a: UnresolvedAttribute => a: NamedExpression
     })
 
-    val windowPartitions = windowExpressions.map(_.windowSpec.windowPartition).distinct
+    val windowPartitions = windowExpressions.collect {
+      case Alias(WindowExpression(_, spec), _) => spec.windowPartition
+    }.distinct
+
     val (restWindowExpressions, _, withWindow) =
       windowPartitions.foldLeft((windowExpressions, attributes, withLateralView)) {
         case ((expressions, propagatedAttrs, plan), part @ WindowPartition(partitionBy, sortBy)) =>
           val (computeExpressions, restWindowExpressions) =
-            expressions.partition(_.windowSpec.windowPartition == part)
+            expressions.partition(
+              _.child.asInstanceOf[WindowExpression].windowSpec.windowPartition == part)
 
           val withWindowPartition = (partitionBy, sortBy) match {
             case (Nil, Nil) => plan
@@ -1134,7 +1140,7 @@ https://cwiki.apache.org/confluence/display/Hive/Enhanced+Aggregation%2C+Cube%2C
   }
 
   protected def parseWindowSpec(windowSpec: Seq[ASTNode]): WindowSpec = {
-    val (partitionClause :: rowsFrame :: valueFrame :: Nil) = getClauses(
+    val (partitionClause :: rowFrame :: rangeFrame :: Nil) = getClauses(
       Seq(
         "TOK_PARTITIONINGSPEC",
         "TOK_WINDOWRANGE",
@@ -1152,16 +1158,16 @@ https://cwiki.apache.org/confluence/display/Hive/Enhanced+Aggregation%2C+Cube%2C
           partition.getChildren.toSeq.asInstanceOf[Seq[ASTNode]])
 
       val partitionBy = distributeByClause.orElse(clusterByClause).toSeq
-      val sortBy = orderByClause.orElse(sortByClause).toSeq
+      val sortBy = clusterByClause.orElse(orderByClause).orElse(sortByClause).toSeq
 
       WindowPartition(
         partitionBy.flatMap(_.getChildren.map(nodeToExpr)),
         sortBy.flatMap(_.getChildren.map(nodeToSortOrder)))
     }.getOrElse(WindowPartition(Nil, Nil))
 
-    val maybeWindowFrame = rowsFrame.orElse(valueFrame).flatMap { frame =>
+    val maybeWindowFrame = rowFrame.orElse(rangeFrame).flatMap { frame =>
       val ranges = frame.getChildren.toList
-      val frameType = rowsFrame.map(_ => RowsFrame).getOrElse(ValueFrame)
+      val frameType = rowFrame.map(_ => RowFrame).getOrElse(RangeFrame)
 
       def nodeToBound(node: Node) = node match {
         case Token("preceding" | "following", Token(count, Nil) :: Nil) =>
@@ -1245,10 +1251,6 @@ https://cwiki.apache.org/confluence/display/Hive/Enhanced+Aggregation%2C+Cube%2C
     /* Aggregate Functions */
     case Token("TOK_FUNCTION", Token(AVG(), Nil) :: arg :: Nil) => Average(nodeToExpr(arg))
     case Token("TOK_FUNCTION", Token(COUNT(), Nil) :: arg :: Nil) => Count(nodeToExpr(arg))
-    case Token("TOK_FUNCTION",
-    Token(COUNT(), Nil) :: arg :: Token("TOK_WINDOWSPEC", spec) :: Nil) =>
-      val count = Count(nodeToExpr(arg))
-      WindowExpression(count, s"w_${nextWindowSpecId.getAndIncrement}", parseWindowSpec(spec))()
     case Token("TOK_FUNCTIONSTAR", Token(COUNT(), Nil) :: Nil) => Count(Literal(1))
     case Token("TOK_FUNCTIONDI", Token(COUNT(), Nil) :: args) => CountDistinct(args.map(nodeToExpr))
     case Token("TOK_FUNCTION", Token(SUM(), Nil) :: arg :: Nil) => Sum(nodeToExpr(arg))
@@ -1387,7 +1389,7 @@ https://cwiki.apache.org/confluence/display/Hive/Enhanced+Aggregation%2C+Cube%2C
       val maybeWindowSpec = specNodes.collectFirst { case Token(_, spec) => parseWindowSpec(spec) }
       val function = UnresolvedFunction(name, argNodes.map(nodeToExpr))
       maybeWindowSpec
-        .map(WindowExpression(function, s"w_${nextWindowSpecId.getAndIncrement}", _)())
+        .map(s => Alias(WindowExpression(function, s), s"w_${nextWindowSpecId.getAndIncrement}")())
         .getOrElse(function)
 
     case Token("TOK_FUNCTIONSTAR", Token(name, Nil) :: args) =>

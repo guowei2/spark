@@ -191,7 +191,7 @@ case class Aggregate(
 
 case class WindowAggregate(
     partitionExpressions: Seq[Expression],
-    windowExpressions: Seq[WindowExpression],
+    windowExpressions: Seq[Alias],
     otherExpressions: Seq[NamedExpression],
     child: LogicalPlan)
   extends UnaryNode {
