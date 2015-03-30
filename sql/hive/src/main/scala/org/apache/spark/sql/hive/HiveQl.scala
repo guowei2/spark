@@ -1188,6 +1188,17 @@ https://cwiki.apache.org/confluence/display/Hive/Enhanced+Aggregation%2C+Cube%2C
     WindowSpec(windowPartition, maybeWindowFrame)
   }
 
+  protected def windowToExpr(node: Node): Option[Expression] = node match {
+    case Token(_, (tn @ Token(name, Nil)) :: tail) =>
+      val (specNodes, argNodes) = tail.partition(_.getText == "TOK_WINDOWSPEC")
+      val maybeWindowSpec = specNodes.collectFirst { case Token(_, spec) => parseWindowSpec(spec) }
+      val newToken = node.asInstanceOf[ASTNode].withChildren((tn :: argNodes).toSeq)
+      maybeWindowSpec
+        .map(s => Alias(WindowExpression(nodeToExpr(newToken), s),
+        s"w_${nextWindowSpecId.getAndIncrement}")())
+    case _ => sys.error(s"Failed to parse node with TOK_WINDOWSPEC")
+  }
+
   protected val escapedIdentifier = "`([^`]+)`".r
   /** Strips backticks from ident if present */
   protected def cleanIdentifier(ident: String): String = ident match {
@@ -1384,16 +1395,11 @@ https://cwiki.apache.org/confluence/display/Hive/Enhanced+Aggregation%2C+Cube%2C
     case Token("TOK_FUNCTION", Token(COALESCE(), Nil) :: list) => Coalesce(list.map(nodeToExpr))
 
     /* UDFs - Must be last otherwise will preempt built in functions */
-    case Token("TOK_FUNCTION", Token(name, Nil) :: tail) =>
-      val (specNodes, argNodes) = tail.partition(_.getText == "TOK_WINDOWSPEC")
-      val maybeWindowSpec = specNodes.collectFirst { case Token(_, spec) => parseWindowSpec(spec) }
-      val function = UnresolvedFunction(name, argNodes.map(nodeToExpr))
-      maybeWindowSpec
-        .map(s => Alias(WindowExpression(function, s), s"w_${nextWindowSpecId.getAndIncrement}")())
-        .getOrElse(function)
+    case node @ Token("TOK_FUNCTION", Token(name, Nil) :: args) =>
+      windowToExpr(node).getOrElse(UnresolvedFunction(name, args.map(nodeToExpr)))
 
-    case Token("TOK_FUNCTIONSTAR", Token(name, Nil) :: args) =>
-      UnresolvedFunction(name, UnresolvedStar(None) :: Nil)
+    case node @ Token("TOK_FUNCTIONSTAR", Token(name, Nil) :: args) =>
+      windowToExpr(node).getOrElse(UnresolvedFunction(name, UnresolvedStar(None) :: Nil))
 
     /* Literals */
     case Token("TOK_NULL", Nil) => Literal.create(null, NullType)
