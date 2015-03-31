@@ -103,6 +103,11 @@ case class WindowAggregate(
     case _ => Seq[SortOrder]()
   }
 
+  // check whether to sort by other key in one partition
+  private[this] val ifSortInOnePartition =
+    !sortExpressions.isEmpty &&
+      !sortExpressions.map(_.child).diff(partitionExpressions).isEmpty
+
   private[this] val sortReference =
     if (sortExpressions.isEmpty) None
     else {
@@ -125,7 +130,7 @@ case class WindowAggregate(
           case _: ArrayType =>
             rows.foreach(function.update)
             function.eval(EmptyRow).asInstanceOf[Seq[Any]].iterator
-          case _ if (!sortExpressions.isEmpty) =>
+          case _ if ifSortInOnePartition =>
             rows.map { row =>
               function.update(row)
               function.eval(EmptyRow)
