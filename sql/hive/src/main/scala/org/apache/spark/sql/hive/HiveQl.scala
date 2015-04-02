@@ -743,31 +743,34 @@ https://cwiki.apache.org/confluence/display/Hive/Enhanced+Aggregation%2C+Cube%2C
         val withProject: LogicalPlan = transformation.getOrElse {
           val selectExpressions =
             nameExpressions(select.getChildren.flatMap(selExprNodeToExpr).toSeq)
-          Seq(
-            groupByClause.map(e => e match {
-              case Token("TOK_GROUPBY", children) =>
-                // Not a transformation so must be either project or aggregation.
-                Aggregate(children.map(nodeToExpr), selectExpressions, withLateralView)
-              case _ => sys.error("Expect GROUP BY")
-            }),
-            groupingSetsClause.map(e => e match {
-              case Token("TOK_GROUPING_SETS", children) =>
-                val(groupByExprs, masks) = extractGroupingSet(children)
-                GroupingSets(masks, groupByExprs, withLateralView, selectExpressions)
-              case _ => sys.error("Expect GROUPING SETS")
-            }),
-            rollupGroupByClause.map(e => e match {
-              case Token("TOK_ROLLUP_GROUPBY", children) =>
-                Rollup(children.map(nodeToExpr), withLateralView, selectExpressions)
-              case _ => sys.error("Expect WITH ROLLUP")
-            }),
-            cubeGroupByClause.map(e => e match {
-              case Token("TOK_CUBE_GROUPBY", children) =>
-                Cube(children.map(nodeToExpr), withLateralView, selectExpressions)
-              case _ => sys.error("Expect WITH CUBE")
-            }),
-            Some(Project(selectExpressions,
-              windowToPlan(selectExpressions, withLateralView)))).flatten.head
+
+          val groupPlan = (selectExprs: Seq[NamedExpression]) =>
+            Seq(
+              groupByClause.map(e => e match {
+                case Token("TOK_GROUPBY", children) =>
+                  // Not a transformation so must be either project or aggregation.
+                  Aggregate(children.map(nodeToExpr), selectExprs, withLateralView)
+                case _ => sys.error("Expect GROUP BY")
+              }),
+              groupingSetsClause.map(e => e match {
+                case Token("TOK_GROUPING_SETS", children) =>
+                  val(groupByExprs, masks) = extractGroupingSet(children)
+                  GroupingSets(masks, groupByExprs, withLateralView, selectExprs)
+                case _ => sys.error("Expect GROUPING SETS")
+              }),
+              rollupGroupByClause.map(e => e match {
+                case Token("TOK_ROLLUP_GROUPBY", children) =>
+                  Rollup(children.map(nodeToExpr), withLateralView, selectExprs)
+                case _ => sys.error("Expect WITH ROLLUP")
+              }),
+              cubeGroupByClause.map(e => e match {
+                case Token("TOK_CUBE_GROUPBY", children) =>
+                  Cube(children.map(nodeToExpr), withLateralView, selectExprs)
+                case _ => sys.error("Expect WITH CUBE")
+              }),
+              Some(withLateralView)).flatten.head
+
+          windowToPlan(selectExpressions, groupPlan)
         }
 
         val withDistinct =
@@ -1099,44 +1102,61 @@ https://cwiki.apache.org/confluence/display/Hive/Enhanced+Aggregation%2C+Cube%2C
 
   protected def windowToPlan(
       selectExpressions: Seq[NamedExpression],
-      withLateralView: LogicalPlan): LogicalPlan = {
+      groupPlan: Seq[NamedExpression] => LogicalPlan): LogicalPlan = {
 
     val windowExpressions =
       selectExpressions.flatMap(_.collect { case a @ Alias(WindowExpression(_, _), _) => a })
 
-    val attributes = selectExpressions.flatMap(_.collect {
-      case a: UnresolvedAttribute => a: NamedExpression
-    })
+    if (windowExpressions.isEmpty) groupPlan(selectExpressions)
+    else {
+      val subSelectExprs =
+        selectExpressions.filter(
+          _.collect { case a @ Alias(WindowExpression(_, _), _) => a }.isEmpty)
 
-    val windowPartitions = windowExpressions.collect {
-      case Alias(WindowExpression(_, spec), _) => spec.windowPartition
-    }.distinct
-
-    val (restWindowExpressions, _, withWindow) =
-      windowPartitions.foldLeft((windowExpressions, attributes, withLateralView)) {
-        case ((expressions, propagatedAttrs, plan), part @ WindowPartition(partitionBy, sortBy)) =>
-          val (computeExpressions, restWindowExpressions) =
-            expressions.partition(
-              _.child.asInstanceOf[WindowExpression].windowSpec.windowPartition == part)
-
-          val withWindowPartition = (partitionBy, sortBy) match {
-            case (Nil, Nil) => plan
-            case (Nil, s)   => Sort(s, false, plan)
-            case (p, Nil)   => Repartition(p, plan)
-            case (p, s)     => SortPartitions(s, Repartition(p, plan))
-          }
-
-          val otherExpressions = (propagatedAttrs ++ (partitionBy ++ sortBy.map(_.child)).collect {
+      val attributes =
+        (
+          windowExpressions.flatMap(_.collect {
             case a: UnresolvedAttribute => a
-          }).distinct
+          }) ++ subSelectExprs.map(_.toAttribute)
+        ).distinct
 
-          (restWindowExpressions, propagatedAttrs ++ computeExpressions.map(_.toAttribute),
-            WindowAggregate(partitionBy, computeExpressions, otherExpressions, withWindowPartition))
+      val windowPartitions = windowExpressions.collect {
+        case Alias(WindowExpression(_, spec), _) => spec.windowPartition
+      }.distinct
+
+      val (restWindowExprs, _, withWindow) =
+        windowPartitions.foldLeft((windowExpressions, attributes, groupPlan(subSelectExprs))) {
+          case ((expressions, attributes, plan), part @ WindowPartition(partitionBy, sortBy)) =>
+            val (computeExprs, restWindowExprs) =
+              expressions.partition(
+                _.child.asInstanceOf[WindowExpression].windowSpec.windowPartition == part)
+
+            val withWindowPartition = (partitionBy, sortBy) match {
+              case (Nil, Nil) => plan
+              case (Nil, s)   => Sort(s, false, plan)
+              case (p, Nil)   => Repartition(p, plan)
+              case (p, s)     => SortPartitions(s, Repartition(p, plan))
+            }
+
+            val otherExpressions = (attributes ++ (partitionBy ++ sortBy.map(_.child)).collect {
+              case a: UnresolvedAttribute => a
+            }).distinct
+
+            (restWindowExprs, attributes ++ computeExprs.map(_.toAttribute),
+              WindowAggregate(partitionBy, computeExprs, otherExpressions, withWindowPartition))
+        }
+
+      assert(restWindowExprs.isEmpty)
+
+      val finalExprs = selectExpressions.map { expr =>
+        expr transform {
+          case u: NamedExpression
+            if windowExpressions.contains(u) || subSelectExprs.contains(u) => u.toAttribute
+        }
       }
 
-    assert(restWindowExpressions.isEmpty)
-
-    withWindow
+      Project(finalExprs.asInstanceOf[Seq[NamedExpression]], withWindow)
+    }
   }
 
   protected def parseWindowSpec(windowSpec: Seq[ASTNode]): WindowSpec = {
