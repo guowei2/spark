@@ -212,7 +212,8 @@ private[spark] object ResolveWindowUdaf extends Rule[LogicalPlan] {
             HiveGenericUdaf(wrapper, wfi, children ++ sortExpr.map(_.child))
           case Sort(sortExpr, _, _) =>
             HiveGenericUdaf(wrapper, wfi, children ++ sortExpr.map(_.child))
-          case _ => sys.error(s"udaf $name with impliesOrder need sort expressions")
+          case _ =>
+            sys.error(s"udaf $wrapper.functionClassName need sort expressions")
         }
         // if function computed with window is `HiveGenericUdf`, we need to check whether
         // it has HiveGenericUadf one, such as lead, lag
@@ -248,7 +249,17 @@ private[hive] case class HiveGenericUdaf(
   @transient
   protected lazy val inspectors = children.map(toInspector)
 
-  def dataType: DataType = inspectorToDataType(objectInspector)
+  protected val pivotResult = windowFunctionInfo.isPivotResult
+
+  def dataType: DataType =
+    if (!pivotResult) inspectorToDataType(objectInspector)
+    else {
+      inspectorToDataType(objectInspector) match {
+        case ArrayType(dt, _) => dt
+        case _ => sys.error(s"error resolve the data type of udaf $funcWrapper.functionClassName")
+      }
+    }
+
 
   def nullable: Boolean = true
 

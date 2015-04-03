@@ -70,23 +70,17 @@ case class WindowAggregate(
 
   case class ComputedWindow(
       unboundFunction: Expression,
-      windowFunctionInfo: WindowFunctionInfo,
+      pivotResult: Boolean,
       windowSpec: WindowSpec,
       boundedFunction: Expression,
       computedAttribute: AttributeReference)
-
-  case class WindowFunctionInfo(
-      supportsWindow: Boolean,
-      pivotResult: Boolean,
-      impliesOrder: Boolean)
 
   private[this] val computedWindows = windowExpressions.collect{
 
     case Alias(expr @ WindowExpression(func, spec), _) =>
       val wfi = func match {
-        case HiveGenericUdaf(_, wfi, _) =>
-          WindowFunctionInfo(wfi.isSupportsWindow, wfi.isPivotResult, wfi.isImpliesOrder)
-        case _ => WindowFunctionInfo(true, false, false)
+        case HiveGenericUdaf(_, wfi, _) => wfi.isPivotResult
+        case _ => false
       }
       ComputedWindow(
         func,
@@ -138,7 +132,7 @@ case class WindowAggregate(
         }
       }.getOrElse {
         val function = baseExpr.newInstance()
-        if (window.windowFunctionInfo.pivotResult) {
+        if (window.pivotResult) {
           rows.foreach(function.update)
           function.eval(EmptyRow).asInstanceOf[Seq[Any]].iterator
         } else if (ifSortInOnePartition) {
