@@ -24,8 +24,7 @@ import scala.collection.mutable.ArrayBuffer
 import org.apache.hadoop.hive.serde2.objectinspector.{ObjectInspector, ConstantObjectInspector}
 import org.apache.hadoop.hive.serde2.objectinspector.ObjectInspectorFactory.ObjectInspectorOptions
 import org.apache.hadoop.hive.serde2.objectinspector.ObjectInspectorFactory
-import org.apache.hadoop.hive.ql.exec.{UDF, UDAF}
-import org.apache.hadoop.hive.ql.exec.{FunctionInfo, FunctionRegistry}
+import org.apache.hadoop.hive.ql.exec._
 import org.apache.hadoop.hive.ql.udf.{UDFType => HiveUDFType}
 import org.apache.hadoop.hive.ql.udf.generic._
 import org.apache.hadoop.hive.ql.udf.generic.GenericUDF._
@@ -33,11 +32,19 @@ import org.apache.hadoop.hive.ql.udf.generic.GenericUDF._
 import org.apache.spark.Logging
 import org.apache.spark.sql.catalyst.analysis
 import org.apache.spark.sql.catalyst.expressions._
-import org.apache.spark.sql.catalyst.plans.logical.{Generate, Project, LogicalPlan}
+import org.apache.spark.sql.catalyst.plans.logical._
 import org.apache.spark.sql.catalyst.rules.Rule
 import org.apache.spark.sql.types._
 import org.apache.spark.sql.catalyst.analysis.MultiAlias
 import org.apache.spark.sql.catalyst.errors.TreeNodeException
+import org.apache.spark.sql.catalyst.plans.logical.SortPartitions
+import org.apache.spark.sql.catalyst.plans.logical.WindowAggregate
+import org.apache.spark.sql.catalyst.expressions.AttributeReference
+import org.apache.spark.sql.catalyst.plans.logical.Generate
+import org.apache.spark.sql.catalyst.plans.logical.Project
+import org.apache.spark.sql.catalyst.expressions.Alias
+import org.apache.spark.sql.catalyst.analysis.MultiAlias
+
 
 /* Implicit conversions */
 import scala.collection.JavaConversions._
@@ -59,10 +66,12 @@ private[hive] abstract class HiveFunctionRegistry
     if (classOf[UDF].isAssignableFrom(functionInfo.getFunctionClass)) {
       HiveSimpleUdf(new HiveFunctionWrapper(functionClassName), children)
     } else if (classOf[GenericUDF].isAssignableFrom(functionInfo.getFunctionClass)) {
-      HiveGenericUdf(new HiveFunctionWrapper(functionClassName), children)
+      HiveGenericUdf(name, new HiveFunctionWrapper(functionClassName), children)
     } else if (
          classOf[AbstractGenericUDAFResolver].isAssignableFrom(functionInfo.getFunctionClass)) {
-      HiveGenericUdaf(new HiveFunctionWrapper(functionClassName), children)
+      val windowFunctionInfo: WindowFunctionInfo =
+        FunctionRegistry.getWindowFunctionInfo(name.toLowerCase)
+      HiveGenericUdaf(new HiveFunctionWrapper(functionClassName), windowFunctionInfo, children)
     } else if (classOf[UDAF].isAssignableFrom(functionInfo.getFunctionClass)) {
       HiveUdaf(new HiveFunctionWrapper(functionClassName), children)
     } else if (classOf[GenericUDTF].isAssignableFrom(functionInfo.getFunctionClass)) {
@@ -136,7 +145,8 @@ private[hive] class DeferredObjectAdapter(oi: ObjectInspector)
   override def get(): AnyRef = wrap(func(), oi)
 }
 
-private[hive] case class HiveGenericUdf(funcWrapper: HiveFunctionWrapper, children: Seq[Expression])
+private[hive] case class HiveGenericUdf(
+    name: String, funcWrapper: HiveFunctionWrapper, children: Seq[Expression])
   extends Expression with HiveInspectors with Logging {
   type UDFType = GenericUDF
   type EvaluatedType = Any
@@ -189,8 +199,37 @@ private[hive] case class HiveGenericUdf(funcWrapper: HiveFunctionWrapper, childr
   }
 }
 
+private[spark] object ResolveWindowUdaf extends Rule[LogicalPlan] {
+  def apply(plan: LogicalPlan): LogicalPlan = plan transformUp {
+
+    case q @ WindowAggregate(_, _, _, child) =>
+      q transformExpressions {
+        // if `isImpliesOrder` is true, we need to use sort expressions as parameters,
+        // such as rank, dense_rank
+        case HiveGenericUdaf(wrapper, wfi, children)
+          if (wfi.isImpliesOrder && children.isEmpty) =>  child match {
+          case SortPartitions(sortExpr, _) =>
+            HiveGenericUdaf(wrapper, wfi, children ++ sortExpr.map(_.child))
+          case Sort(sortExpr, _, _) =>
+            HiveGenericUdaf(wrapper, wfi, children ++ sortExpr.map(_.child))
+          case _ => sys.error(s"udaf $name with impliesOrder need sort expressions")
+        }
+        // if function computed with window is `HiveGenericUdf`, we need to check whether
+        // it has HiveGenericUadf one, such as lead, lag
+        case HiveGenericUdf(name, wrapper, children) =>
+          val windowFunctionInfo: WindowFunctionInfo =
+            Option(FunctionRegistry.getWindowFunctionInfo(name.toLowerCase)).getOrElse(
+              sys.error(s"Couldn't find udaf function $name"))
+          HiveGenericUdaf(new HiveFunctionWrapper(windowFunctionInfo.getFunctionClass.getName),
+            windowFunctionInfo, children)
+      }
+
+  }
+}
+
 private[hive] case class HiveGenericUdaf(
     funcWrapper: HiveFunctionWrapper,
+    @transient windowFunctionInfo: WindowFunctionInfo,
     children: Seq[Expression]) extends AggregateExpression
   with HiveInspectors {
 

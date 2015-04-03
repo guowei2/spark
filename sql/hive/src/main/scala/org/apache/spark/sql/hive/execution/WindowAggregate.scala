@@ -15,7 +15,7 @@
  * limitations under the License.
  */
 
-package org.apache.spark.sql.execution
+package org.apache.spark.sql.hive.execution
 
 import java.util.HashMap
 
@@ -23,24 +23,24 @@ import org.apache.spark.annotation.DeveloperApi
 import org.apache.spark.sql.catalyst.dsl.expressions._
 import org.apache.spark.sql.catalyst.errors._
 import org.apache.spark.sql.catalyst.expressions._
-import org.apache.spark.sql.catalyst.plans.physical.{AllTuples, ClusteredDistribution}
+import org.apache.spark.sql.catalyst.plans.physical.AllTuples
 import org.apache.spark.util.collection.CompactBuffer
 import org.apache.spark.sql.types._
 import org.apache.spark.sql.catalyst.plans.physical.ClusteredDistribution
 import org.apache.spark.sql.catalyst.expressions.InterpretedMutableProjection
-import org.apache.spark.sql.execution.Sort
+import org.apache.spark.sql.execution.{UnaryNode, SparkPlan, Sort}
 import org.apache.spark.sql.catalyst.expressions.SortOrder
 import org.apache.spark.sql.catalyst.expressions.WindowFrame
 import org.apache.spark.sql.catalyst.expressions.WindowSpec
 import org.apache.spark.sql.catalyst.expressions.AttributeReference
 import org.apache.spark.sql.catalyst.expressions.WindowExpression
 import org.apache.spark.sql.catalyst.expressions.Alias
-import org.apache.spark.sql.catalyst.plans.logical.Repartition
+import org.apache.spark.sql.hive.HiveGenericUdaf
 
 
 /**
  * :: DeveloperApi ::
- * Groups input data by `partitionExpressions` and computes the `computeExpressions` for each
+ * Groups input data by `partitionExpressions` and computes the `windowExpressions` for each
  * group.
  * @param partitionExpressions expressions that are evaluated to determine partition.
  * @param windowExpressions computeExpressions that compute now for each partition.
@@ -70,14 +70,27 @@ case class WindowAggregate(
 
   case class ComputedWindow(
       unboundFunction: Expression,
+      windowFunctionInfo: WindowFunctionInfo,
       windowSpec: WindowSpec,
       boundedFunction: Expression,
       computedAttribute: AttributeReference)
 
+  case class WindowFunctionInfo(
+      supportsWindow: Boolean,
+      pivotResult: Boolean,
+      impliesOrder: Boolean)
+
   private[this] val computedWindows = windowExpressions.collect{
+
     case Alias(expr @ WindowExpression(func, spec), _) =>
+      val wfi = func match {
+        case HiveGenericUdaf(_, wfi, _) =>
+          WindowFunctionInfo(wfi.isSupportsWindow, wfi.isPivotResult, wfi.isImpliesOrder)
+        case _ => WindowFunctionInfo(true, false, false)
+      }
       ComputedWindow(
         func,
+        wfi,
         spec,
         BindReferences.bindReference(func, child.output),
         AttributeReference(s"funcResult:$func", func.dataType, func.nullable)())
@@ -118,28 +131,25 @@ case class WindowAggregate(
   private[this] def computeFunctions(rows: CompactBuffer[Row]): Seq[Iterator[Any]] =
     computedWindows.map{ window =>
       val baseExpr = window.boundedFunction.asInstanceOf[AggregateExpression]
-      window.windowSpec.windowFrame.map {frame =>
+      window.windowSpec.windowFrame.map { frame =>
         frame.frameType match {
           case RowFrame => rowFrameFunction(baseExpr, frame, rows).iterator
           case RangeFrame => rangeFrameFunction(baseExpr, frame, rows).iterator
         }
       }.getOrElse {
         val function = baseExpr.newInstance()
-        function.dataType match {
-          // TODO: check WindowFunction.pivotResult
-          case _: ArrayType =>
-            rows.foreach(function.update)
-            function.eval(EmptyRow).asInstanceOf[Seq[Any]].iterator
-          case _ if ifSortInOnePartition =>
-            rows.map { row =>
-              function.update(row)
-              function.eval(EmptyRow)
-            }.iterator
-          case _ => {
-            rows.foreach(function.update)
-            val result = function.eval(EmptyRow)
-            (0 to rows.size - 1).map(r => result).iterator
-          }
+        if (window.windowFunctionInfo.pivotResult) {
+          rows.foreach(function.update)
+          function.eval(EmptyRow).asInstanceOf[Seq[Any]].iterator
+        } else if (ifSortInOnePartition) {
+          rows.map { row =>
+            function.update(row)
+            function.eval(EmptyRow)
+          }.iterator
+        } else {
+          rows.foreach(function.update)
+          val result = function.eval(EmptyRow)
+          (0 to rows.size - 1).map(r => result).iterator
         }
 
       }

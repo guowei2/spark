@@ -193,6 +193,14 @@ private[hive] trait HiveStrategies {
     }
   }
 
+  object WindowFunction extends Strategy {
+    def apply(plan: LogicalPlan): Seq[SparkPlan] = plan match {
+      case logical.WindowAggregate(partition, window, other, child) =>
+        execution.WindowAggregate(partition, window, other, planLater(child)) :: Nil
+      case _ => Nil
+    }
+  }
+
   /**
    * Retrieves data using a HiveTableScan.  Partition pruning predicates are also detected and
    * applied.
