@@ -768,7 +768,7 @@ https://cwiki.apache.org/confluence/display/Hive/Enhanced+Aggregation%2C+Cube%2C
                   Cube(children.map(nodeToExpr), withLateralView, selectExprs)
                 case _ => sys.error("Expect WITH CUBE")
               }),
-              Some(withLateralView)).flatten.head
+              Some(Project(selectExprs, withLateralView))).flatten.head
 
           windowToPlan(selectExpressions, groupPlan)
         }
@@ -1113,6 +1113,10 @@ https://cwiki.apache.org/confluence/display/Hive/Enhanced+Aggregation%2C+Cube%2C
         selectExpressions.filter(
           _.collect { case a @ Alias(WindowExpression(_, _), _) => a }.isEmpty)
 
+      val childPlan = groupPlan(subSelectExprs).transform {
+        case Project(_, child) => child
+      }
+
       val attributes =
         (
           windowExpressions.flatMap(_.collect {
@@ -1125,7 +1129,7 @@ https://cwiki.apache.org/confluence/display/Hive/Enhanced+Aggregation%2C+Cube%2C
       }.distinct
 
       val (restWindowExprs, _, withWindow) =
-        windowPartitions.foldLeft((windowExpressions, attributes, groupPlan(subSelectExprs))) {
+        windowPartitions.foldLeft((windowExpressions, attributes, childPlan)) {
           case ((expressions, attributes, plan), part @ WindowPartition(partitionBy, sortBy)) =>
             val (computeExprs, restWindowExprs) =
               expressions.partition(
