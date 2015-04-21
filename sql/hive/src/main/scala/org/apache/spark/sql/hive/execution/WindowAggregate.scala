@@ -75,16 +75,19 @@ case class WindowAggregate(
       boundedFunction: Expression,
       computedAttribute: AttributeReference)
 
+  case class WindowFunctionInfo(
+      supportsWindow: Boolean, pivotResult: Boolean, impliesOrder: Boolean)
+
   private[this] val computedWindows = windowExpressions.collect{
 
     case Alias(expr @ WindowExpression(func, spec), _) =>
-      val wfi = func match {
+      val ipr = func match {
         case HiveGenericUdaf(_, wfi, _) => wfi.isPivotResult
         case _ => false
       }
       ComputedWindow(
         func,
-        wfi,
+        ipr,
         spec,
         BindReferences.bindReference(func, child.output),
         AttributeReference(s"funcResult:$func", func.dataType, func.nullable)())
@@ -189,7 +192,9 @@ case class WindowAggregate(
         case ShortType => (Literal(frame.preceding.toShort), Literal(frame.following.toShort))
         case DecimalType() =>
           (Literal(BigDecimal(frame.preceding)), Literal(BigDecimal(frame.following)))
-        case _=> throw new Exception(s"not support dataType ")
+        // TODO: need to support StringType comparison
+        case StringType => throw new Exception(s"not support StringType comparison yet")
+        case dt => throw new Exception(s"not support $dt comparison")
       }
     }.getOrElse {
       throw new Exception(s"not support range frame with no sort expression ")
