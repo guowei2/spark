@@ -201,7 +201,7 @@ private[spark] object ResolveWindowUdaf extends Rule[LogicalPlan] {
           sys.error(s"udaf ${wrapper.functionClassName} does not support window frame")
         // if `isImpliesOrder` is true, we need to use sort expressions as parameters,
         // such as rank, dense_rank
-        case WindowExpression(HiveGenericUdaf(wrapper, wfi, children), _)
+        case HiveGenericUdaf(wrapper, wfi, children)
           if (wfi.isImpliesOrder && children.isEmpty) =>  child match {
           case SortPartitions(sortExpr, _) =>
             HiveGenericUdaf(wrapper, wfi, children ++ sortExpr.map(_.child))
@@ -212,7 +212,7 @@ private[spark] object ResolveWindowUdaf extends Rule[LogicalPlan] {
         }
         // if function computed with window is `HiveGenericUdf`, we need to check whether
         // it has HiveGenericUadf one, such as lead, lag
-        case WindowExpression(HiveGenericUdf(name, wrapper, children), _) =>
+        case HiveGenericUdf(name, wrapper, children) =>
           val windowFunctionInfo: WindowFunctionInfo =
             Option(FunctionRegistry.getWindowFunctionInfo(name.toLowerCase)).getOrElse(
               sys.error(s"Couldn't find udaf function $name"))
