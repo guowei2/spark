@@ -17,8 +17,7 @@
 
 package org.apache.spark.sql.catalyst.expressions
 
-import org.apache.spark.sql.catalyst.trees
-import org.apache.spark.sql.catalyst.analysis.UnresolvedAttribute
+import org.apache.spark.sql.types.DataType
 
 
 /**
@@ -29,11 +28,11 @@ case class WindowExpression(child: Expression, windowSpec: WindowSpec) extends U
 
   override type EvaluatedType = Any
 
-  override def eval(input: Row) = child.eval(input)
+  override def eval(input: Row): Any = child.eval(input)
 
-  override def dataType = child.dataType
-  override def nullable = child.nullable
-  override def foldable = child.foldable
+  override def dataType: DataType = child.dataType
+  override def foldable: Boolean = child.foldable
+  override def nullable: Boolean = child.nullable
 
   override def toString: String = s"$child $windowSpec"
 }

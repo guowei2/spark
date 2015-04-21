@@ -22,20 +22,13 @@ import java.util.HashMap
 import org.apache.spark.annotation.DeveloperApi
 import org.apache.spark.sql.catalyst.dsl.expressions._
 import org.apache.spark.sql.catalyst.errors._
-import org.apache.spark.sql.catalyst.expressions._
-import org.apache.spark.sql.catalyst.plans.physical.AllTuples
 import org.apache.spark.util.collection.CompactBuffer
 import org.apache.spark.sql.types._
-import org.apache.spark.sql.catalyst.plans.physical.ClusteredDistribution
-import org.apache.spark.sql.catalyst.expressions.InterpretedMutableProjection
 import org.apache.spark.sql.execution.{UnaryNode, SparkPlan, Sort}
-import org.apache.spark.sql.catalyst.expressions.SortOrder
-import org.apache.spark.sql.catalyst.expressions.WindowFrame
-import org.apache.spark.sql.catalyst.expressions.WindowSpec
-import org.apache.spark.sql.catalyst.expressions.AttributeReference
-import org.apache.spark.sql.catalyst.expressions.WindowExpression
-import org.apache.spark.sql.catalyst.expressions.Alias
+import org.apache.spark.sql.catalyst.expressions._
+import org.apache.spark.sql.catalyst.plans.physical._
 import org.apache.spark.sql.hive.HiveGenericUdaf
+import org.apache.spark.rdd.RDD
 
 
 /**
@@ -55,7 +48,7 @@ case class WindowAggregate(
     child: SparkPlan)
   extends UnaryNode {
 
-  override def requiredChildDistribution =
+  override def requiredChildDistribution: List[Distribution]  =
     if (partitionExpressions == Nil) {
       AllTuples :: Nil
     } else {
@@ -66,7 +59,7 @@ case class WindowAggregate(
   // out child's output attributes statically here.
   private[this] val childOutput = child.output
 
-  override def output = (windowExpressions ++ otherExpressions).map(_.toAttribute)
+  override def output: Seq[Attribute] = (windowExpressions ++ otherExpressions).map(_.toAttribute)
 
   case class ComputedWindow(
       unboundFunction: Expression,
@@ -257,7 +250,7 @@ case class WindowAggregate(
   }
 
 
-  override def execute() = attachTree(this, "execute") {
+  override def execute(): RDD[Row] = attachTree(this, "execute") {
     if (partitionExpressions.isEmpty) {
       child.execute().mapPartitions { iter =>
 

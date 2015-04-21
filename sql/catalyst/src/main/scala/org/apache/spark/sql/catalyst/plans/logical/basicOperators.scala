@@ -196,7 +196,7 @@ case class WindowAggregate(
     child: LogicalPlan)
   extends UnaryNode {
 
-  override def output = (windowExpressions ++ otherExpressions).map(_.toAttribute)
+  override def output: Seq[Attribute] = (windowExpressions ++ otherExpressions).map(_.toAttribute)
 }
 
 /**
