@@ -216,7 +216,8 @@ private[spark] object ResolveWindowUdaf extends Rule[LogicalPlan] {
           val windowFunctionInfo: WindowFunctionInfo =
             Option(FunctionRegistry.getWindowFunctionInfo(name.toLowerCase)).getOrElse(
               sys.error(s"Couldn't find udaf function $name"))
-          HiveGenericUdaf(new HiveFunctionWrapper(windowFunctionInfo.getFunctionClass.getName),
+          HiveGenericUdaf(
+            new HiveFunctionWrapper(windowFunctionInfo.getfInfo().getFunctionClass.getName),
             windowFunctionInfo, children)
       }
 
