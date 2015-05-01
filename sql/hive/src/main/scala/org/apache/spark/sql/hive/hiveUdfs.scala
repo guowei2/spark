@@ -19,6 +19,7 @@ package org.apache.spark.sql.hive
 
 import java.util
 
+import org.apache.hadoop.hive.ql.udf.generic.GenericUDAFEvaluator.AggregationBuffer
 import org.apache.hadoop.hive.ql.udf.generic.GenericUDFUtils.ConversionHelper
 import org.apache.spark.sql.AnalysisException
 
@@ -330,7 +331,7 @@ private[hive] case class HiveWindowFunction(
   //protected lazy val cached = new Array[AnyRef](children.length)
 
   @transient
-  private lazy val hiveEvaluatorBuffer = evaluator.getNewAggregationBuffer
+  private var hiveEvaluatorBuffer: AggregationBuffer = _
   // Output buffer.
   private var outputBuffer: Any = _
 
@@ -340,6 +341,10 @@ private[hive] case class HiveWindowFunction(
 
   // Reset the hiveEvaluatorBuffer and outputPosition
   override def reset(): Unit = {
+    // We create a new aggregation buffer to workaround the bug in GenericUDAFRowNumber.
+    // Basically, GenericUDAFRowNumberEvaluator.reset calls RowNumberBuffer.init.
+    // However, RowNumberBuffer.init does not really reset this buffer.
+    hiveEvaluatorBuffer = evaluator.getNewAggregationBuffer
     evaluator.reset(hiveEvaluatorBuffer)
   }
 

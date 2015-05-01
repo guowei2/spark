@@ -209,8 +209,8 @@ abstract class HiveWindowFunctionQueryBaseSuite extends HiveComparisonTest with 
       |order by s, a limit 100;
       |select s, avg(i) over (partition by t, b order by s) a from over10k
       |order by s, a limit 100;
-      |select max(i) over w m from over10k window w as (partition by f)
-      |order by m limit 100;
+      |select max(i) over w m from over10k
+      |order by m window w as (partition by f) limit 100 ;
       |select s, avg(d) over (partition by t order by f) a from over10k
       |order by s, a limit 100;
      """.stripMargin, reset = false)
@@ -238,12 +238,12 @@ abstract class HiveWindowFunctionQueryBaseSuite extends HiveComparisonTest with 
       |order by s, sum limit 100;
       |select f, sum(f) over
       |(partition by ts order by f range between unbounded preceding and current row) sum
-      |from over10k order by s, sum limit 100;
+      |from over10k order by f, sum limit 100;
       |select s, i, round(avg(d) over (partition by s order by i) / 10.0 , 2) avg
       |from over10k order by s, avg limit 7;
       |select s, i, round((avg(d) over  w1 + 10.0) - (avg(d) over w1 - 10.0),2) avg
-      |from over10k window w1 as (partition by s order by i)
-      |order by s, avg limit 7;
+      |from over10k
+      |order by s, i, avg window w1 as (partition by s order by i) limit 7;
      """.stripMargin, reset = false)
 
   /////////////////////////////////////////////////////////////////////////////
@@ -259,7 +259,7 @@ abstract class HiveWindowFunctionQueryBaseSuite extends HiveComparisonTest with 
       |select s, cume_dist() over (partition by bo order by b,s) cd from over10k
       |order by s, cd limit 100;
       |select s, percent_rank() over (partition by dec order by f) r from over10k
-      |order by r desc, r desc limit 100;
+      |order by s desc, r desc limit 100;
      """.stripMargin, reset = false)
 
   createQueryTest("windowing_rank.q (deterministic) 2",
