@@ -30,7 +30,7 @@ import org.scalatest.BeforeAndAfter
  * for different tests and there are a few properties needed to let Hive generate golden
  * files, every `createQueryTest` calls should explicitly set `reset` to `false`.
  */
-class HiveWindowFunctionQuerySuite extends HiveComparisonTest with BeforeAndAfter {
+abstract class HiveWindowFunctionQueryBaseSuite extends HiveComparisonTest with BeforeAndAfter {
   private val originalTimeZone = TimeZone.getDefault
   private val originalLocale = Locale.getDefault
   private val testTempDir = Utils.createTempDir()
@@ -58,11 +58,36 @@ class HiveWindowFunctionQuerySuite extends HiveComparisonTest with BeforeAndAfte
         |  p_retailprice DOUBLE,
         |  p_comment STRING)
       """.stripMargin)
-    val testData = TestHive.getHiveFile("data/files/part_tiny.txt").getCanonicalPath
+    val testData1 = TestHive.getHiveFile("data/files/part_tiny.txt").getCanonicalPath
     sql(
       s"""
-        |LOAD DATA LOCAL INPATH '$testData' overwrite into table part
+        |LOAD DATA LOCAL INPATH '$testData1' overwrite into table part
       """.stripMargin)
+
+    sql("DROP TABLE IF EXISTS over10k")
+    sql(
+      """
+        |create table over10k(
+        |  t tinyint,
+        |  si smallint,
+        |  i int,
+        |  b bigint,
+        |  f float,
+        |  d double,
+        |  bo boolean,
+        |  s string,
+        |	 ts timestamp,
+        |  dec decimal(4,2),
+        |  bin binary)
+        |row format delimited
+        |fields terminated by '|';
+      """.stripMargin)
+    val testData2 = TestHive.getHiveFile("data/files/over10k").getCanonicalPath
+    sql(
+      s"""
+        |LOAD DATA LOCAL INPATH '$testData2' overwrite into table over10k
+      """.stripMargin)
+
     // The following settings are used for generating golden files with Hive.
     // We have to use kryo to correctly let Hive serialize plans with window functions.
     // This is used to generate golden files.
@@ -153,6 +178,25 @@ class HiveWindowFunctionQuerySuite extends HiveComparisonTest with BeforeAndAfte
     */
   }
 
+  // Seems the original windowing_multipartitioning.q is not deterministic.
+  createQueryTest("windowing_multipartitioning.q (deterministic) 1",
+    s"""
+      |select s,
+      |rank() over (partition by s order by si) r,
+      |sum(b) over (partition by s order by si) sum
+      |from over10k
+      |order by s, r, sum
+      |limit 100;
+    """.stripMargin, reset = false)
+
+  createQueryTest("windowing_multipartitioning.q (deterministic) 2",
+    s"""
+      |select DISTINCT p_mfgr, p_name, p_size,
+      |sum(p_size) over w1 as s
+      |from part
+      |window w1 as
+      |(partition by p_mfgr order by p_name rows between 2 preceding and 2 following)
+     """.stripMargin, reset = false)
 
   /////////////////////////////////////////////////////////////////////////////
   // Tests from windowing.q
@@ -590,4 +634,99 @@ class HiveWindowFunctionQuerySuite extends HiveComparisonTest with BeforeAndAfte
       |from part
       |order by p_name
     """.stripMargin, reset = false)
+}
+
+class HiveWindowFunctionQueryWithoutCodeGenSuite extends HiveWindowFunctionQueryBaseSuite {
+  var originalCodegenEnabled: Boolean = _
+  override def beforeAll(): Unit = {
+    super.beforeAll()
+    originalCodegenEnabled = conf.codegenEnabled
+    sql("set spark.sql.codegen=false")
+  }
+
+  override def afterAll(): Unit = {
+    sql(s"set spark.sql.codegen=$originalCodegenEnabled")
+    super.afterAll()
+  }
+}
+
+abstract class HiveWindowFunctionQueryFileBaseSuite
+  extends HiveCompatibilitySuite with BeforeAndAfter {
+  private val originalTimeZone = TimeZone.getDefault
+  private val originalLocale = Locale.getDefault
+  private val testTempDir = Utils.createTempDir()
+
+  import org.apache.spark.sql.hive.test.TestHive.implicits._
+
+  override def beforeAll() {
+    TestHive.cacheTables = true
+    // Timezone is fixed to America/Los_Angeles for those timezone sensitive tests (timestamp_*)
+    TimeZone.setDefault(TimeZone.getTimeZone("America/Los_Angeles"))
+    // Add Locale setting
+    Locale.setDefault(Locale.US)
+
+    // The following settings are used for generating golden files with Hive.
+    // We have to use kryo to correctly let Hive serialize plans with window functions.
+    // This is used to generate golden files.
+    sql("set hive.plan.serialization.format=kryo")
+    // Explicitly set fs to local fs.
+    sql(s"set fs.default.name=file://$testTempDir/")
+    // Ask Hive to run jobs in-process as a single map and reduce task.
+    sql("set mapred.job.tracker=local")
+  }
+
+  override def afterAll() {
+    TestHive.cacheTables = false
+    TimeZone.setDefault(originalTimeZone)
+    Locale.setDefault(originalLocale)
+    TestHive.reset()
+  }
+
+  override def blackList: Seq[String] = Seq(
+    // Partitioned table functions are not supported.
+    "ptf*",
+    // tests of windowing.q are in HiveWindowFunctionQueryBaseSuite
+    "windowing.q",
+
+    // This one failed on the expression of
+    // sum(lag(p_retailprice,1,0.0)) over w1
+    // lag(p_retailprice,1,0.0) is a GenericUDF and the argument inspector of
+    // p_retailprice created by HiveInspectors is
+    // PrimitiveObjectInspectorFactory.javaDoubleObjectInspector.
+    // However, seems Hive assumes it is
+    // PrimitiveObjectInspectorFactory.writableDoubleObjectInspector, which introduces an error.
+    "windowing_expressions",
+
+    // Hive's results are not deterministic
+    "windowing_multipartitioning",
+    "windowing_navfn",
+    "windowing_ntile",
+    "windowing_udaf",
+    "windowing_windowspec",
+    "windowing_rank"
+  )
+
+  override def whiteList = Seq(
+    "windowing_udaf2",
+    "windowing_columnPruning",
+    "windowing_adjust_rowcontainer_sz"
+  )
+
+  override def testCases = super.testCases.filter {
+    case (name, _) => realWhiteList.contains(name)
+  }
+}
+
+class HiveWindowFunctionQueryFileWithoutCodeGenSuite extends HiveWindowFunctionQueryFileBaseSuite {
+  var originalCodegenEnabled: Boolean = _
+  override def beforeAll(): Unit = {
+    super.beforeAll()
+    originalCodegenEnabled = conf.codegenEnabled
+    sql("set spark.sql.codegen=false")
+  }
+
+  override def afterAll(): Unit = {
+    sql(s"set spark.sql.codegen=$originalCodegenEnabled")
+    super.afterAll()
+  }
 }

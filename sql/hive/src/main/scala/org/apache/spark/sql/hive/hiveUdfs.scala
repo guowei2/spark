@@ -209,7 +209,6 @@ private[spark] object ResolveHiveWindowFunction extends Rule[LogicalPlan] {
               throw new AnalysisException(s"Couldn't find window function $name"))
 
           val functionClassName = windowFunctionInfo.getFunctionClass.getName
-
           val newChildren =
             // Rank(), DENSE_RANK(), CUME_DIST(), and PERCENT_RANK do not take explicit
             // input parameters. These functions in Hive require implicit parameters, which
@@ -344,9 +343,9 @@ private[hive] case class HiveWindowFunction(
     evaluator.reset(hiveEvaluatorBuffer)
   }
 
-  override def prepareInputParameters(input: Row): AnyRef =
+  override def prepareInputParameters(input: Row): AnyRef = {
     wrap(inputProjection(input), inputInspectors, new Array[AnyRef](children.length))
-
+  }
   // Add input parameters for a single row.
   override def update(input: AnyRef): Unit = {
     evaluator.iterate(hiveEvaluatorBuffer, input.asInstanceOf[Array[AnyRef]])

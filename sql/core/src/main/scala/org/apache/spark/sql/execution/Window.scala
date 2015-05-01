@@ -43,24 +43,6 @@ case class Window(
   // will not change the ordering of input rows.
   override def outputOrdering: Seq[SortOrder] = child.outputOrdering
 
-  // Although input rows are grouped based on windowSpec.partitionSpec, we need to
-  // know when we have a new partition.
-  // This is to manually construct an ordering that can be used to compare rows.
-  private val partitionOrdering: RowOrdering =
-    RowOrdering.forSchema(windowSpec.partitionSpec.map(_.dataType))
-  // This is used to project expressions for the partition specification.
-  @transient protected lazy val partitionGenerator =
-    newProjection(windowSpec.partitionSpec, child.output)
-
-  // rowOrdering is used to compare two rows based on the expressions in the ORDER BY clause
-  // in the OVER clause. This is used for RANGE based window frame (offsets specified in a
-  // RANGE frame indicates the number of groups of rows having the same ordering).
-  private val rowOrdering: RowOrdering =
-    RowOrdering.forSchema(windowSpec.orderSpec.map(_.dataType))
-  // This is ued to project expressions for the order specification.
-  @transient protected lazy val rowOrderGenerator =
-    newProjection(windowSpec.orderSpec.map(_.child), child.output)
-
   case class ComputedWindow(
     unbound: WindowExpression,
     windowFunction: WindowFunction,
@@ -108,6 +90,22 @@ case class Window(
     child.execute().mapPartitions { iter =>
       new Iterator[Row] {
 
+        // Although input rows are grouped based on windowSpec.partitionSpec, we need to
+        // know when we have a new partition.
+        // This is to manually construct an ordering that can be used to compare rows.
+        // TODO: We may want to have a newOrdering that takes BoundReferences.
+        // So, we can take advantave of code gen.
+        private val partitionOrdering: Ordering[Row] =
+          RowOrdering.forSchema(windowSpec.partitionSpec.map(_.dataType))
+
+        // This is used to project expressions for the partition specification.
+        protected val partitionGenerator =
+          newMutableProjection(windowSpec.partitionSpec, child.output)()
+
+        // This is ued to project expressions for the order specification.
+        protected val rowOrderGenerator =
+          newMutableProjection(windowSpec.orderSpec.map(_.child), child.output)()
+
         // The position of next output row in the inputRowBuffer.
         var rowPosition: Int = 0
         // The number of buffered rows in the inputRowBuffer (the size of the current partition).
@@ -125,54 +123,63 @@ case class Window(
 
         def createBoundaryEvaluator(): () => Unit = {
           def findPhysicalBoundary(
-              boundary: FrameBoundary): Int = boundary match {
-            case UnboundedPreceding => 0
-            case UnboundedFollowing => partitionSize - 1
-            case CurrentRow => rowPosition
+              boundary: FrameBoundary): () => Int = boundary match {
+            case UnboundedPreceding => () => 0
+            case UnboundedFollowing => () => partitionSize - 1
+            case CurrentRow => () => rowPosition
             case ValuePreceding(value) =>
-              val newPosition = rowPosition - value
-              if (newPosition > 0) newPosition else 0
+              () =>
+                val newPosition = rowPosition - value
+                if (newPosition > 0) newPosition else 0
             case ValueFollowing(value) =>
-              val newPosition = rowPosition + value
-              if (newPosition < partitionSize) newPosition else partitionSize - 1
+              () =>
+                val newPosition = rowPosition + value
+                if (newPosition < partitionSize) newPosition else partitionSize - 1
           }
 
           def findLogicalBoundary(
               boundary: FrameBoundary,
               searchDirection: Int,
               evaluator: Expression,
-              joinedRow: JoinedRow): Int = boundary match {
-            case UnboundedPreceding => 0
-            case UnboundedFollowing => partitionSize - 1
+              joinedRow: JoinedRow): () => Int = boundary match {
+            case UnboundedPreceding => () => 0
+            case UnboundedFollowing => () => partitionSize - 1
             case other =>
-              // CurrentRow, ValuePreceding, or ValueFollowing.
-              var newPosition = rowPosition + searchDirection
-              var stopSearch = false
-              val currentOrderByValue = rowOrderGenerator(inputRowBuffer(rowPosition))
-              while (newPosition >= 0 && newPosition < partitionSize && !stopSearch) {
-                val r = rowOrderGenerator(inputRowBuffer(newPosition))
-                stopSearch =
-                  !(evaluator.eval(joinedRow(currentOrderByValue, r)).asInstanceOf[Boolean])
-                if (!stopSearch) {
-                  newPosition += searchDirection
+              () => {
+                // CurrentRow, ValuePreceding, or ValueFollowing.
+                var newPosition = rowPosition + searchDirection
+                var stopSearch = false
+                // rowOrderGenerator is a mutable projection.
+                // We need to make a copy of the returned by rowOrderGenerator since we will
+                // compare searched row with this currentOrderByValue.
+                val currentOrderByValue = rowOrderGenerator(inputRowBuffer(rowPosition)).copy()
+                while (newPosition >= 0 && newPosition < partitionSize && !stopSearch) {
+                  val r = rowOrderGenerator(inputRowBuffer(newPosition))
+                  stopSearch =
+                    !(evaluator.eval(joinedRow(currentOrderByValue, r)).asInstanceOf[Boolean])
+                  if (!stopSearch) {
+                    newPosition += searchDirection
+                  }
                 }
-              }
-              newPosition -= searchDirection
+                newPosition -= searchDirection
 
-              if (newPosition < 0) {
-                0
-              } else if (newPosition >= partitionSize) {
-                partitionSize - 1
-              } else {
-                newPosition
+                if (newPosition < 0) {
+                  0
+                } else if (newPosition >= partitionSize) {
+                  partitionSize - 1
+                } else {
+                  newPosition
+                }
               }
           }
 
           windowFrame.frameType match {
             case RowFrame =>
+              val findStart = findPhysicalBoundary(windowFrame.frameStart)
+              val findEnd = findPhysicalBoundary(windowFrame.frameEnd)
               () => {
-                frameStart = findPhysicalBoundary(windowFrame.frameStart)
-                frameEnd = findPhysicalBoundary(windowFrame.frameEnd)
+                frameStart = findStart()
+                frameEnd = findEnd()
               }
             case RangeFrame =>
               val joinedRowForBoundaryEvaluation: JoinedRow = new JoinedRow()
@@ -201,11 +208,21 @@ case class Window(
                 case o => Literal(true) // This is just a dummy expression.
               }
 
+              val findStart =
+                findLogicalBoundary(
+                  boundary = windowFrame.frameStart,
+                  searchDirection = -1,
+                  evaluator = frameStartEvaluator,
+                  joinedRow = joinedRowForBoundaryEvaluation)
+              val findEnd =
+                findLogicalBoundary(
+                  boundary = windowFrame.frameEnd,
+                  searchDirection = 1,
+                  evaluator = frameEndEvaluator,
+                  joinedRow = joinedRowForBoundaryEvaluation)
               () => {
-                frameStart = findLogicalBoundary(
-                  windowFrame.frameStart, -1, frameStartEvaluator, joinedRowForBoundaryEvaluation)
-                frameEnd = findLogicalBoundary(
-                  windowFrame.frameEnd, 1, frameEndEvaluator, joinedRowForBoundaryEvaluation)
+                frameStart = findStart()
+                frameEnd = findEnd()
               }
           }
         }
@@ -238,9 +255,9 @@ case class Window(
 
         // The projection used to generate the final result rows of this operator.
         private[this] val resultProjection =
-          newProjection(
+          newMutableProjection(
             projectList ++ windowExpressionResult,
-            projectList ++ computedSchema)
+            projectList ++ computedSchema)()
 
         // The row used to hold results of window functions.
         private[this] val windowExpressionResultRow =
@@ -254,7 +271,9 @@ case class Window(
         private def initialize(): Unit = {
           if (iter.hasNext) {
             val currentRow = iter.next().copy()
-            nextPartitionKey = partitionGenerator(currentRow)
+            // partitionGenerator is a mutable projection. Since we need to track nextPartitionKey,
+            // we are making a copy of the returned partitionKey at here.
+            nextPartitionKey = partitionGenerator(currentRow).copy()
             firstRowInNextPartition = currentRow
             fetchNextPartition()
           } else {
@@ -283,14 +302,12 @@ case class Window(
             // Get all results of the window functions for this output row.
             var i = 0
             while (i < functions.length) {
-              // println("functions(i).get(rowPosition) " + functions(i).get(rowPosition))
               windowExpressionResultRow.update(i, functions(i).get(rowPosition))
               i += 1
             }
 
             // Construct the output row.
             val outputRow = resultProjection(joinedRow(inputRow, windowExpressionResultRow))
-            // println("outputRow " + outputRow)
             // We will move to the next one.
             rowPosition += 1
             if (requireUpdateFrame && rowPosition < partitionSize) {
@@ -325,6 +342,7 @@ case class Window(
             // Make a copy of the input row since we will put it in the buffer.
             val currentRow = iter.next().copy()
             // Get the partition key based on the partition specification.
+            // For the below compare method, we do not need to make a copy of partitionKey.
             val partitionKey = partitionGenerator(currentRow)
             // Check if the current row belongs the current input row.
             val comparing = partitionOrdering.compare(currentPartitionKey, partitionKey)
@@ -334,7 +352,10 @@ case class Window(
             } else {
               // The current input row is in a different partition.
               findNextPartition = true
-              nextPartitionKey = partitionKey
+              // partitionGenerator is a mutable projection.
+              // Since we need to track nextPartitionKey and we determine that it should be set
+              // as partitionKey, we are making a copy of the partitionKey at here.
+              nextPartitionKey = partitionKey.copy()
               firstRowInNextPartition = currentRow
             }
           }
@@ -405,7 +426,6 @@ case class Window(
           val previousFrameEnd = frameEnd
           boundaryEvaluator()
 
-          //println(s"frameStart: $frameStart frameEnd: $frameEnd previousFrameStart: $previousFrameStart previousFrameEnd: $previousFrameEnd partitionSize: $partitionSize rowPosition: $rowPosition inputRowBuffer.size: ${inputRowBuffer.size}")
           updateWindowFunctionParameterBuffers(
             frameStart - previousFrameStart,
             frameEnd - previousFrameEnd,
@@ -422,7 +442,6 @@ case class Window(
             functions(i).reset()
             // Get all buffered input parameters based on rows of this window frame.
             val inputParameters = windowFunctionParameterBuffers(i).toArray()
-            // println("inputParameters.size " + inputParameters.size)
             // Send these input parameters to the window function.
             functions(i).batchUpdate(inputParameters)
             // Ask the function to evaluate based on this window frame.
