@@ -80,7 +80,7 @@ abstract class HiveWindowFunctionQueryBaseSuite extends HiveComparisonTest with 
         |  dec decimal(4,2),
         |  bin binary)
         |row format delimited
-        |fields terminated by '|';
+        |fields terminated by '|'
       """.stripMargin)
     val testData2 = TestHive.getHiveFile("data/files/over10k").getCanonicalPath
     sql(
@@ -105,80 +105,10 @@ abstract class HiveWindowFunctionQueryBaseSuite extends HiveComparisonTest with 
     TestHive.reset()
   }
 
-  test("explain") {
-    /*
-    sql(
-      s"""
-      |select p_mfgr, p_name, p_size,
-      |rank() over(distribute by p_mfgr sort by p_name) as r,
-      |dense_rank() over(distribute by p_mfgr sort by p_name) as dr,
-      |sum(p_retailprice) over
-      |(distribute by p_mfgr sort by p_name rows between unbounded preceding and current row) as s1
-      |from part
-    """.stripMargin).explain(true)
-
-
-    sql(
-      s"""
-      |select p_mfgr, p_name, p_size,
-      |min(p_retailprice),
-      |rank() over(distribute by p_mfgr sort by p_name)as r,
-      |dense_rank() over(distribute by p_mfgr sort by p_name) as dr,
-      |p_size, p_size - lag(p_size,1,p_size) over(distribute by p_mfgr sort by p_name) as deltaSz
-      |from part
-      |group by p_mfgr, p_name, p_size
-      """.stripMargin).explain(true)
-
-    sql(
-      s"""
-      |select p_mfgr, p_name, p_size, min(p_retailprice),
-      |rank() over(distribute by p_mfgr sort by p_name) as r,
-      |dense_rank() over(distribute by p_mfgr sort by p_name) as dr,
-      |p_size, p_size - lag(p_size,1,p_size) over(distribute by p_mfgr sort by p_name) as deltaSz
-      |from part
-      |group by p_mfgr, p_name, p_size
-      |having p_size > 0
-      """.stripMargin).explain(true)
-
-    sql(
-      s"""
-      |select  p_mfgr,p_name, p_size,
-      |sum(p_size) over w2 as s2,
-      |first_value(p_size) over
-      |(partition by p_mfgr order by p_name rows between 2 preceding and 2 following)  as f,
-      |last_value(p_size, false) over w1  as l
-      |from part
-      |window w1 as (distribute by p_mfgr sort by p_name rows between 2 preceding and 2 following),
-      |w2 as (distribute by p_mfgr sort by p_name rows between current row and current row)
-      """.stripMargin).explain(true)
-
-    sql(
-      s"""
-      |select  p_mfgr,p_name, p_size,
-      |sum(p_size) over w2 as s2,
-      |first_value(p_size) over
-      |(partition by p_name order by p_name rows between 2 preceding and 2 following)  as f,
-      |last_value(p_size, false) over w1  as l
-      |from part
-      |window w1 as (distribute by p_mfgr sort by p_name rows between 2 preceding and 2 following),
-      |w2 as (distribute by p_mfgr sort by p_name rows between current row and current row)
-      """.stripMargin).explain(true)
-
-    sql(
-      s"""
-      |select p_mfgr, p_name, p_size,
-      |rank() over(distribute by p_mfgr sort by p_name) as r
-      |from part
-      """.stripMargin).explain(true)
-
-    sql(
-      """
-        |select 200 + count(*) from part group by p_mfgr
-      """.stripMargin).explain(true)
-    */
-  }
-
-  // Seems the original windowing_multipartitioning.q is not deterministic.
+  /////////////////////////////////////////////////////////////////////////////
+  // Tests based on windowing_multipartitioning.q
+  // Results of the original query file are not deterministic.
+  /////////////////////////////////////////////////////////////////////////////
   createQueryTest("windowing_multipartitioning.q (deterministic) 1",
     s"""
       |select s,
@@ -189,13 +119,198 @@ abstract class HiveWindowFunctionQueryBaseSuite extends HiveComparisonTest with 
       |limit 100;
     """.stripMargin, reset = false)
 
+  /* timestamp comparison issue with Hive?
   createQueryTest("windowing_multipartitioning.q (deterministic) 2",
     s"""
-      |select DISTINCT p_mfgr, p_name, p_size,
-      |sum(p_size) over w1 as s
-      |from part
-      |window w1 as
-      |(partition by p_mfgr order by p_name rows between 2 preceding and 2 following)
+      |select s,
+      |rank() over (partition by s order by dec desc) r,
+      |sum(b) over (partition by s order by ts desc) as sum
+      |from over10k
+      |where s = 'tom allen' or s = 'bob steinbeck'
+      |order by s, r, sum;
+     """.stripMargin, reset = false)
+  */
+
+  createQueryTest("windowing_multipartitioning.q (deterministic) 3",
+    s"""
+      |select s, sum(i) over (partition by s), sum(f) over (partition by si)
+      |from over10k where s = 'tom allen' or s = 'bob steinbeck';
+     """.stripMargin, reset = false)
+
+  createQueryTest("windowing_multipartitioning.q (deterministic) 4",
+    s"""
+      |select s, rank() over (partition by s order by bo),
+      |rank() over (partition by si order by bin desc) from over10k
+      |where s = 'tom allen' or s = 'bob steinbeck';
+     """.stripMargin, reset = false)
+
+  createQueryTest("windowing_multipartitioning.q (deterministic) 5",
+    s"""
+      |select s, sum(f) over (partition by i), row_number() over (order by f)
+      |from over10k where s = 'tom allen' or s = 'bob steinbeck';
+     """.stripMargin, reset = false)
+
+  createQueryTest("windowing_multipartitioning.q (deterministic) 6",
+    s"""
+      |select s, rank() over w1,
+      |rank() over w2
+      |from over10k
+      |where s = 'tom allen' or s = 'bob steinbeck'
+      |window
+      |w1 as (partition by s order by dec),
+      |w2 as (partition by si order by f) ;
+     """.stripMargin, reset = false)
+
+  /////////////////////////////////////////////////////////////////////////////
+  // Tests based on windowing_navfn.q
+  // Results of the original query file are not deterministic.
+  /////////////////////////////////////////////////////////////////////////////
+  createQueryTest("windowing_navfn.q (deterministic)",
+    s"""
+      |select s, row_number() over (partition by d order by dec) rn from over10k
+      |order by s, rn desc limit 100;
+      |select i, lead(s) over (partition by bin order by d,i desc) as l from over10k
+      |order by i desc, l limit 100;
+      |select i, lag(dec) over (partition by i order by s,i,dec) l from over10k
+      |order by i, l limit 100;
+      |select s, last_value(t) over (partition by d order by f) l from over10k
+      |order by s, l limit 100;
+      |select s, first_value(s) over (partition by bo order by s) f from over10k
+      |order by s, f limit 100;
+      |select t, s, i, last_value(i) over (partition by t order by s)
+      |from over10k where (s = 'oscar allen' or s = 'oscar carson') and t = 10;
+     """.stripMargin, reset = false)
+
+  /////////////////////////////////////////////////////////////////////////////
+  // Tests based on windowing_ntile.q
+  // Results of the original query file are not deterministic.
+  /////////////////////////////////////////////////////////////////////////////
+  createQueryTest("windowing_ntile.q (deterministic)",
+    s"""
+      |select i, ntile(10) over (partition by s order by i) n from over10k
+      |order by i, n limit 100;
+      |select s, ntile(100) over (partition by i order by s) n from over10k
+      |order by s, n limit 100;
+      |select f, ntile(4) over (partition by d order by f) n from over10k
+      |order by f, n limit 100;
+      |select d, ntile(1000) over (partition by dec order by d) n from over10k
+      |order by d, n limit 100;
+     """.stripMargin, reset = false)
+
+  /////////////////////////////////////////////////////////////////////////////
+  // Tests based on windowing_udaf.q
+  // Results of the original query file are not deterministic.
+  /////////////////////////////////////////////////////////////////////////////
+  createQueryTest("windowing_udaf.q (deterministic)",
+    s"""
+      |select s, min(i) over (partition by s) m from over10k
+      |order by s, m limit 100;
+      |select s, avg(f) over (partition by si order by s) a from over10k
+      |order by s, a limit 100;
+      |select s, avg(i) over (partition by t, b order by s) a from over10k
+      |order by s, a limit 100;
+      |select max(i) over w m from over10k window w as (partition by f)
+      |order by m limit 100;
+      |select s, avg(d) over (partition by t order by f) a from over10k
+      |order by s, a limit 100;
+     """.stripMargin, reset = false)
+
+  /////////////////////////////////////////////////////////////////////////////
+  // Tests based on windowing_windowspec.q
+  // Results of the original query file are not deterministic.
+  /////////////////////////////////////////////////////////////////////////////
+  createQueryTest("windowing_windowspec.q (deterministic)",
+    s"""
+      |select s, sum(b) over (partition by i order by s,b rows unbounded preceding) as sum
+      |from over10k order by s, sum limit 100;
+      |select s, sum(f) over (partition by d order by s,f rows unbounded preceding) as sum
+      |from over10k order by s, sum limit 100;
+      |select s, sum(f) over
+      |(partition by ts order by f range between current row and unbounded following) as sum
+      |from over10k order by s, sum limit 100;
+      |select s, avg(f)
+      |over (partition by ts order by s,f rows between current row and 5 following) avg
+      |from over10k order by s, avg limit 100;
+      |select s, avg(d) over
+      |(partition by t order by s,d desc rows between 5 preceding and 5 following) avg
+      |from over10k order by s, avg limit 100;
+      |select s, sum(i) over(partition by ts order by s) sum from over10k
+      |order by s, sum limit 100;
+      |select f, sum(f) over
+      |(partition by ts order by f range between unbounded preceding and current row) sum
+      |from over10k order by s, sum limit 100;
+      |select s, i, round(avg(d) over (partition by s order by i) / 10.0 , 2) avg
+      |from over10k order by s, avg limit 7;
+      |select s, i, round((avg(d) over  w1 + 10.0) - (avg(d) over w1 - 10.0),2) avg
+      |from over10k window w1 as (partition by s order by i)
+      |order by s, avg limit 7;
+     """.stripMargin, reset = false)
+
+  /////////////////////////////////////////////////////////////////////////////
+  // Tests based on windowing_rank.q
+  // Results of the original query file are not deterministic.
+  /////////////////////////////////////////////////////////////////////////////
+  createQueryTest("windowing_rank.q (deterministic) 1",
+    s"""
+      |select s, rank() over (partition by f order by t) r from over10k order by s, r limit 100;
+      |select s, dense_rank() over (partition by ts order by i,s desc) as r from over10k
+      |order by s desc, r desc
+      |limit 100;
+      |select s, cume_dist() over (partition by bo order by b,s) cd from over10k
+      |order by s, cd limit 100;
+      |select s, percent_rank() over (partition by dec order by f) r from over10k
+      |order by r desc, r desc limit 100;
+     """.stripMargin, reset = false)
+
+  createQueryTest("windowing_rank.q (deterministic) 2",
+    s"""
+      |select ts, dec, rnk
+      |from
+      |  (select ts, dec,
+      |          rank() over (partition by ts order by dec)  as rnk
+      |          from
+      |            (select other.ts, other.dec
+      |             from over10k other
+      |             join over10k on (other.b = over10k.b)
+      |            ) joined
+      |  ) ranked
+      |where rnk =  1
+      |order by ts, dec, rnk
+      |limit 10;
+     """.stripMargin, reset = false)
+
+  createQueryTest("windowing_rank.q (deterministic) 3",
+    s"""
+      |select ts, dec, rnk
+      |from
+      |  (select ts, dec,
+      |          rank() over (partition by ts order by dec)  as rnk
+      |          from
+      |            (select other.ts, other.dec
+      |             from over10k other
+      |             join over10k on (other.b = over10k.b)
+      |            ) joined
+      |  ) ranked
+      |where dec = 89.5
+      |order by ts, dec, rnk
+      |limit 10;
+     """.stripMargin, reset = false)
+
+  createQueryTest("windowing_rank.q (deterministic) 4",
+    s"""
+      |select ts, dec, rnk
+      |from
+      |  (select ts, dec,
+      |          rank() over (partition by ts order by dec)  as rnk
+      |          from
+      |            (select other.ts, other.dec
+      |             from over10k other
+      |             join over10k on (other.b = over10k.b)
+      |             where other.t < 10
+      |            ) joined
+      |  ) ranked
+      |where rnk = 1
+      |order by ts, dec, rnk limit 10;
      """.stripMargin, reset = false)
 
   /////////////////////////////////////////////////////////////////////////////
