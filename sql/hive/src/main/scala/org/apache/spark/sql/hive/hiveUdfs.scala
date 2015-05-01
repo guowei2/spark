@@ -17,23 +17,28 @@
 
 package org.apache.spark.sql.hive
 
-import org.apache.hadoop.hive.ql.udf.generic.GenericUDFUtils.ConversionHelper
+import java.util
 
+import org.apache.hadoop.hive.ql.udf.generic.GenericUDAFEvaluator.AggregationBuffer
+import org.apache.hadoop.hive.ql.udf.generic.GenericUDFUtils.ConversionHelper
+import org.apache.spark.sql.AnalysisException
+
+import scala.collection.mutable
 import scala.collection.mutable.ArrayBuffer
 
 import org.apache.hadoop.hive.serde2.objectinspector.{ObjectInspector, ConstantObjectInspector}
 import org.apache.hadoop.hive.serde2.objectinspector.ObjectInspectorFactory.ObjectInspectorOptions
 import org.apache.hadoop.hive.serde2.objectinspector.ObjectInspectorFactory
-import org.apache.hadoop.hive.ql.exec.{UDF, UDAF}
-import org.apache.hadoop.hive.ql.exec.{FunctionInfo, FunctionRegistry}
+import org.apache.hadoop.hive.ql.exec._
 import org.apache.hadoop.hive.ql.udf.{UDFType => HiveUDFType}
 import org.apache.hadoop.hive.ql.udf.generic._
 import org.apache.hadoop.hive.ql.udf.generic.GenericUDF._
 
 import org.apache.spark.Logging
 import org.apache.spark.sql.catalyst.analysis
+import org.apache.spark.sql.catalyst.analysis.Star
 import org.apache.spark.sql.catalyst.expressions._
-import org.apache.spark.sql.catalyst.plans.logical.{Generate, Project, LogicalPlan}
+import org.apache.spark.sql.catalyst.plans.logical._
 import org.apache.spark.sql.catalyst.rules.Rule
 import org.apache.spark.sql.types._
 import org.apache.spark.sql.catalyst.analysis.MultiAlias
@@ -187,6 +192,200 @@ private[hive] case class HiveGenericUdf(funcWrapper: HiveFunctionWrapper, childr
   override def toString: String = {
     s"$nodeName#${funcWrapper.functionClassName}(${children.mkString(",")})"
   }
+}
+
+private[spark] object ResolveHiveWindowFunction extends Rule[LogicalPlan] {
+  def apply(plan: LogicalPlan): LogicalPlan = plan transformUp {
+    case p: LogicalPlan if !p.childrenResolved => p
+
+    // We are resolving WindowExpressions at here.
+    case p: LogicalPlan =>
+      p transformExpressions {
+        case WindowExpression(
+          UnresolvedWindowFunction(name, children),
+          windowSpec: WindowSpecDefinition) =>
+          // First, let's find the window function info.
+          val windowFunctionInfo: WindowFunctionInfo =
+            Option(FunctionRegistry.getWindowFunctionInfo(name.toLowerCase)).getOrElse(
+              throw new AnalysisException(s"Couldn't find window function $name"))
+
+          val functionClassName = windowFunctionInfo.getFunctionClass.getName
+          val newChildren =
+            // Rank(), DENSE_RANK(), CUME_DIST(), and PERCENT_RANK do not take explicit
+            // input parameters. These functions in Hive require implicit parameters, which
+            // are expressions in Order By clause.
+            if (classOf[GenericUDAFRank].isAssignableFrom(windowFunctionInfo.getFunctionClass)) {
+              if (children.nonEmpty) {
+               throw  new AnalysisException(s"$name does not take input parameters.")
+              }
+              windowSpec.orderSpec.map(_.child)
+            } else {
+              children
+            }
+
+          val isUDAFBridgeRequired =
+            if (classOf[UDAF].isAssignableFrom(windowFunctionInfo.getFunctionClass)) {
+              true
+            } else {
+              false
+            }
+
+          val windowFunction =
+            HiveWindowFunction(
+              new HiveFunctionWrapper(functionClassName),
+              windowFunctionInfo.isPivotResult,
+              isUDAFBridgeRequired,
+              newChildren)
+
+          // Second, check if the specified window function can accept window definition.
+          windowSpec.frameSpecification match {
+            case frame: SpecifiedWindowFrame if !windowFunctionInfo.isSupportsWindow =>
+              throw new AnalysisException(
+                s"Window function $name does not take a frame specification.")
+            case frame: SpecifiedWindowFrame
+              if windowFunctionInfo.isSupportsWindow && windowFunctionInfo.isPivotResult =>
+              // These two should not be true at the same time when a window frame is defined.
+              // If so, throw an exception.
+              throw new AnalysisException(s"Could not handle Hive window function $name because " +
+                s"it supports both a user specified window frame and pivot result.")
+            case _ => // OK
+          }
+          // Resolve those UnspecifiedWindowFrame.
+          val newWindowSpec = windowSpec.frameSpecification match {
+            case UnspecifiedFrame =>
+              val newWindowFrame =
+                SpecifiedWindowFrame.defaultWindowFrame(
+                  windowSpec.orderSpec.nonEmpty,
+                  windowFunctionInfo.isSupportsWindow)
+              WindowSpecDefinition(windowSpec.partitionSpec, windowSpec.orderSpec, newWindowFrame)
+            case _ => windowSpec
+          }
+
+          WindowExpression(windowFunction, newWindowSpec)
+      }
+  }
+}
+
+
+// If pivotResult is true, the Hive function will return a list of values representing the
+// values of the added columns.
+private[hive] case class HiveWindowFunction(
+    funcWrapper: HiveFunctionWrapper,
+    pivotResult: Boolean,
+    isUDAFBridgeRequired: Boolean,
+    children: Seq[Expression]) extends WindowFunction
+  with HiveInspectors {
+
+  // Hive window functions are based on GenericUDAFResolver2.
+  type UDFType = GenericUDAFResolver2
+
+  @transient
+  protected lazy val resolver: GenericUDAFResolver2 =
+    if (isUDAFBridgeRequired) {
+      new GenericUDAFBridge(funcWrapper.createFunction[UDAF]())
+    } else {
+      funcWrapper.createFunction[GenericUDAFResolver2]()
+    }
+
+  @transient
+  protected lazy val inputInspectors = children.map(toInspector).toArray
+
+  // The GenericUDAFEvaluator used to evaluate the window function.
+  @transient
+  protected lazy val evaluator: GenericUDAFEvaluator = {
+    val parameterInfo = new SimpleGenericUDAFParameterInfo(inputInspectors, false, false)
+    resolver.getEvaluator(parameterInfo)
+  }
+
+  // The object inspector of values returned from the Hive window fucntion.
+  @transient
+  protected lazy val returnInspector  = {
+    evaluator.init(GenericUDAFEvaluator.Mode.COMPLETE, inputInspectors)
+  }
+
+  def dataType: DataType =
+    if (!pivotResult) {
+      inspectorToDataType(returnInspector)
+    } else {
+      // If pivotResult is true, we should take the element type out as the data type of this
+      // function.
+      inspectorToDataType(returnInspector) match {
+        case ArrayType(dt, _) => dt
+        case _ =>
+          sys.error(
+            s"error resolve the data type of window function ${funcWrapper.functionClassName}")
+      }
+    }
+
+  def nullable: Boolean = true
+
+  override type EvaluatedType = Any
+
+  override def eval(input: Row): Any =
+    throw new TreeNodeException(this, s"No function to evaluate expression. type: ${this.nodeName}")
+
+  @transient
+  lazy val inputProjection = new InterpretedProjection(children)
+
+  //@transient
+  //protected lazy val cached = new Array[AnyRef](children.length)
+
+  @transient
+  private var hiveEvaluatorBuffer: AggregationBuffer = _
+  // Output buffer.
+  private var outputBuffer: Any = _
+
+  override def init(): Unit = {
+    evaluator.init(GenericUDAFEvaluator.Mode.COMPLETE, inputInspectors)
+  }
+
+  // Reset the hiveEvaluatorBuffer and outputPosition
+  override def reset(): Unit = {
+    // We create a new aggregation buffer to workaround the bug in GenericUDAFRowNumber.
+    // Basically, GenericUDAFRowNumberEvaluator.reset calls RowNumberBuffer.init.
+    // However, RowNumberBuffer.init does not really reset this buffer.
+    hiveEvaluatorBuffer = evaluator.getNewAggregationBuffer
+    evaluator.reset(hiveEvaluatorBuffer)
+  }
+
+  override def prepareInputParameters(input: Row): AnyRef = {
+    wrap(inputProjection(input), inputInspectors, new Array[AnyRef](children.length))
+  }
+  // Add input parameters for a single row.
+  override def update(input: AnyRef): Unit = {
+    evaluator.iterate(hiveEvaluatorBuffer, input.asInstanceOf[Array[AnyRef]])
+  }
+
+  override def batchUpdate(inputs: Array[AnyRef]): Unit = {
+    var i = 0
+    while (i < inputs.length) {
+      evaluator.iterate(hiveEvaluatorBuffer, inputs(i).asInstanceOf[Array[AnyRef]])
+      i += 1
+    }
+  }
+
+  override def evaluate(): Unit = {
+    outputBuffer = unwrap(evaluator.evaluate(hiveEvaluatorBuffer), returnInspector)
+  }
+
+  override def get(index: Int): Any = {
+    if (!pivotResult) {
+      // if pivotResult is false, we will get a single value for all rows in the frame.
+      outputBuffer
+    } else {
+      // if pivotResult is true, we will get a Seq having the same size with the size
+      // of the window frame. At here, we will return the result at the position of
+      // index in the output buffer.
+      outputBuffer.asInstanceOf[Seq[Any]].get(index)
+    }
+  }
+
+  override def toString: String = {
+    s"$nodeName#${funcWrapper.functionClassName}(${children.mkString(",")})"
+  }
+
+  override def newInstance: WindowFunction =
+    new HiveWindowFunction(funcWrapper, pivotResult, isUDAFBridgeRequired, children)
 }
 
 private[hive] case class HiveGenericUdaf(
