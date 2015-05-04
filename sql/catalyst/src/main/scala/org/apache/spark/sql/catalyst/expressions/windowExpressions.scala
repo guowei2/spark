@@ -239,6 +239,8 @@ trait WindowFunction extends Expression {
   def get(index: Int): Any
 
   def newInstance(): WindowFunction
+
+  def newInstanceWithChildren(newChildren: Seq[Expression]): WindowFunction
 }
 
 case class UnresolvedWindowFunction(
@@ -252,7 +254,7 @@ case class UnresolvedWindowFunction(
   override lazy val resolved = false
 
   override def init(): Unit =
-    throw new UnresolvedException(this, "reset")
+    throw new UnresolvedException(this, "init")
   override def reset(): Unit =
     throw new UnresolvedException(this, "reset")
   override def prepareInputParameters(input: Row): AnyRef =
@@ -273,6 +275,9 @@ case class UnresolvedWindowFunction(
 
   override def newInstance(): WindowFunction =
     throw new UnresolvedException(this, "newInstance")
+
+  override def newInstanceWithChildren(newChildren: Seq[Expression]): WindowFunction =
+    throw new UnresolvedException(this, "newInstanceWithChildren")
 }
 
 case class UnresolvedWindowExpression(

@@ -384,6 +384,10 @@ private[hive] case class HiveWindowFunction(
     s"$nodeName#${funcWrapper.functionClassName}(${children.mkString(",")})"
   }
 
+  override def newInstanceWithChildren(newChildren: Seq[Expression]): WindowFunction = {
+    new HiveWindowFunction(funcWrapper, pivotResult, isUDAFBridgeRequired, newChildren)
+  }
+
   override def newInstance: WindowFunction =
     new HiveWindowFunction(funcWrapper, pivotResult, isUDAFBridgeRequired, children)
 }

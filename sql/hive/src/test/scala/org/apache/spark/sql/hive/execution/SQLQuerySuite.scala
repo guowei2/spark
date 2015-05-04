@@ -45,6 +45,11 @@ case class Order(
     state: String,
     month: Int)
 
+case class windowData(
+    month: Int,
+    area: String,
+    product: Int)
+
 /**
  * A collection of hive query tests where we generate the answers ourselves instead of depending on
  * Hive to generate them (in contrast to HiveQuerySuite).  Often this is because the query is
@@ -568,5 +573,77 @@ class SQLQuerySuite extends QueryTest {
     assert(100000 ===
       sql("SELECT TRANSFORM (d1, d2, d3) USING 'cat' AS (a,b,c) FROM script_trans")
       .queryExecution.toRdd.count())
+  }
+
+  test("window function: udaf with aggregate expressin") {
+    val data = Seq(
+      windowData(1, "a", 5),
+      windowData(2, "a", 6),
+      windowData(3, "b", 7),
+      windowData(4, "b", 8),
+      windowData(5, "c", 9),
+      windowData(6, "c", 10)
+    )
+    sparkContext.parallelize(data).toDF().registerTempTable("windowData")
+
+    checkAnswer(
+      sql(
+        """
+          |select area, sum(product), sum(sum(product)) over (partition by area)
+          |from windowData group by month, area
+        """.stripMargin),
+      Seq(
+        ("a", 5, 11),
+        ("a", 6, 11),
+        ("b", 7, 15),
+        ("b", 8, 15),
+        ("c", 9, 19),
+        ("c", 10, 19)
+      ).map(i => Row(i._1, i._2, i._3)))
+
+    checkAnswer(
+      sql(
+        """
+          |select area, sum(product) - 1, sum(sum(product)) over (partition by area)
+          |from windowData group by month, area
+        """.stripMargin),
+      Seq(
+        ("a", 4, 11),
+        ("a", 5, 11),
+        ("b", 6, 15),
+        ("b", 7, 15),
+        ("c", 8, 19),
+        ("c", 9, 19)
+      ).map(i => Row(i._1, i._2, i._3)))
+
+    checkAnswer(
+      sql(
+        """
+          |select area, sum(product), sum(product) / sum(sum(product)) over (partition by area)
+          |from windowData group by month, area
+        """.stripMargin),
+      Seq(
+        ("a", 5, 5d/11),
+        ("a", 6, 6d/11),
+        ("b", 7, 7d/15),
+        ("b", 8, 8d/15),
+        ("c", 10, 10d/19),
+        ("c", 9, 9d/19)
+      ).map(i => Row(i._1, i._2, i._3)))
+
+    checkAnswer(
+      sql(
+        """
+          |select area, sum(product), sum(product) / sum(sum(product) - 1) over (partition by area)
+          |from windowData group by month, area
+        """.stripMargin),
+      Seq(
+        ("a", 5, 5d/9),
+        ("a", 6, 6d/9),
+        ("b", 7, 7d/13),
+        ("b", 8, 8d/13),
+        ("c", 10, 10d/17),
+        ("c", 9, 9d/17)
+      ).map(i => Row(i._1, i._2, i._3)))
   }
 }

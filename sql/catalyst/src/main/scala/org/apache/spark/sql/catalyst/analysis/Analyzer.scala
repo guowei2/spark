@@ -23,6 +23,8 @@ import org.apache.spark.sql.catalyst.expressions._
 import org.apache.spark.sql.catalyst.plans.logical._
 import org.apache.spark.sql.catalyst.rules._
 import org.apache.spark.sql.types._
+import scala.collection.mutable.ArrayBuffer
+import java.util.concurrent.atomic.AtomicInteger
 
 /**
  * A trivial [[Analyzer]] with an [[EmptyCatalog]] and [[EmptyFunctionRegistry]]. Used for testing
@@ -535,6 +537,8 @@ class Analyzer(
   }
 
   object ResolveWindowFunction extends Rule[LogicalPlan] {
+    protected val nextWindowSpecId: AtomicInteger = new AtomicInteger(0)
+    
     def hasWindowFunction(projectList: Seq[NamedExpression]): Boolean = {
       projectList.foreach ( _.foreach {
         case window: WindowExpression => return true
@@ -553,6 +557,40 @@ class Analyzer(
       return false
     }
 
+    def takeOffAlias(expr: Expression): Expression = expr match {
+      case Alias(child, name) => takeOffAlias(child)
+      case other => other
+    }
+
+    def assignAliases(expr: Expression): NamedExpression = expr match {
+      case ne: NamedExpression => ne
+      case e => Alias(e, s"w${nextWindowSpecId.getAndIncrement}")()
+    }
+    
+    def pushdownExpr(
+        expr: Expression,
+        childExprs: Seq[NamedExpression],
+        childExprsAlias: Map[Expression, NamedExpression],
+        pushdownExprs: ArrayBuffer[NamedExpression]): Expression = expr match {
+      case b: BinaryArithmetic if b.left.foldable =>
+        b.withNewChildren(
+          Seq(b.left, pushdownExpr(b.right, childExprs, childExprsAlias, pushdownExprs)))
+      case b: BinaryArithmetic if b.right.foldable =>
+        b.withNewChildren(
+          Seq(pushdownExpr(b.left, childExprs, childExprsAlias, pushdownExprs), b.right))
+      case ne: NamedExpression =>
+        if ((AttributeSet(Seq(expr)) -- childExprs).nonEmpty) {
+          pushdownExprs += ne
+        }
+        ne
+      case e: Expression =>
+        val named = assignAliases(e)
+        if (!childExprsAlias.contains(expr)) {
+          pushdownExprs += named
+        }
+        named.toAttribute
+    }
+
     /**
      * From a Seq of [[NamedExpression]]s, extract window expressions and
      * other regular expressions.
@@ -560,18 +598,43 @@ class Analyzer(
     def extract(
         expressions: Seq[NamedExpression]): (Seq[NamedExpression], Seq[NamedExpression]) = {
       val (windowExpressions, regularExpressions) = expressions.partition(hasWindowFunction)
-      // Also need to extract all UnresolvedAttribute from windowExpressions.
-      // For example, in the case of SUM(x) OVER (...), we need to extract x.
-      val attributes = windowExpressions.flatMap(_.collect {
-        case attribute: Attribute => attribute
-      })
 
-      // Figure out which ones are missing from the regularExpressions,
-      // so that we can add them.
-      val requiredAttributes = AttributeSet(attributes)
-      val missingInProject = requiredAttributes -- regularExpressions
+      // 1. Substitute expression in windowExpressions with alias in regularExpressions if possible
+      // 2. Push down expressions which in windowExpressions but not in regularExpressions
+      // For example,
+      // select sum(key) as s1, sum(sum(key)) over (partition by value) from src group by value
+      // we need substitute the inner sum(key) with s1 and push down value to regularExpressions
+      val regularExprsAlias = regularExpressions.collect {
+        case a @ Alias(child, name) => (takeOffAlias(child), a)
+      }.toMap
 
-      (windowExpressions, regularExpressions ++ missingInProject)
+      val substitutedWindowExpressions = windowExpressions.map {
+        _.transform {
+          case expr if regularExprsAlias.contains(expr) =>
+            regularExprsAlias.get(expr).get.toAttribute
+        }.asInstanceOf[NamedExpression]
+      }
+
+      val pushdownExpressions = new ArrayBuffer[NamedExpression]()
+      val newWindowExpressions = substitutedWindowExpressions.map {
+        _.transform {
+          case wf : WindowFunction =>
+            val newChildren = wf.children.map(
+              pushdownExpr(_, regularExpressions, regularExprsAlias, pushdownExpressions))
+            wf.newInstanceWithChildren(newChildren)
+          case wsc @ WindowSpecDefinition(partitionSpec, orderSpec, _) =>
+            val newPartitionSpec = partitionSpec.map(
+              pushdownExpr(_, regularExpressions, regularExprsAlias, pushdownExpressions)
+            )
+            val newOrderSpec = orderSpec.map { so =>
+              val newChild =
+                pushdownExpr(so.child, regularExpressions, regularExprsAlias, pushdownExpressions)
+              so.copy(child = newChild)
+            }
+            wsc.copy(partitionSpec = newPartitionSpec, orderSpec = newOrderSpec)
+        }.asInstanceOf[NamedExpression]
+      }
+      (newWindowExpressions, regularExpressions ++ pushdownExpressions)
     }
 
     def addWindow(windowExpressions: Seq[NamedExpression], child: LogicalPlan): LogicalPlan = {
