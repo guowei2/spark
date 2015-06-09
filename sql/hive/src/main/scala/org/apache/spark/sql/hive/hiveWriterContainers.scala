@@ -17,6 +17,7 @@
 
 package org.apache.spark.sql.hive
 
+import java.security.PrivilegedExceptionAction
 import java.text.NumberFormat
 import java.util.Date
 
@@ -32,6 +33,8 @@ import org.apache.hadoop.mapred._
 import org.apache.hadoop.hive.common.FileUtils
 
 import org.apache.spark.mapred.SparkHadoopMapRedUtil
+
+import org.apache.hadoop.security.UserGroupInformation
 import org.apache.spark.sql.Row
 import org.apache.spark.{Logging, SerializableWritable, SparkHadoopWriter}
 import org.apache.spark.sql.catalyst.util.DateUtils
@@ -58,6 +61,8 @@ private[hive] class SparkHiveWriterContainer(
     Utilities.copyTableJobPropertiesToConf(tableDesc, jobConf)
   }
   protected val conf = new SerializableWritable(jobConf)
+  protected val doAs = conf.value.get("hive.server2.enable.doAs", "false").toBoolean
+  protected val user = UserGroupInformation.getCurrentUser.getUserName
 
   private var jobID = 0
   private var splitID = 0
@@ -108,13 +113,26 @@ private[hive] class SparkHiveWriterContainer(
   protected def initWriters() {
     // NOTE this method is executed at the executor side.
     // For Hive tables without partitions or with only static partitions, only 1 writer is needed.
-    writer = HiveFileFormatUtils.getHiveRecordWriter(
-      conf.value,
-      fileSinkConf.getTableInfo,
-      conf.value.getOutputValueClass.asInstanceOf[Class[Writable]],
-      fileSinkConf,
-      FileOutputFormat.getTaskOutputPath(conf.value, getOutputName),
-      Reporter.NULL)
+    if (doAs) {
+      val ugi = UserGroupInformation.createRemoteUser(user)
+      writer = ugi.doAs(new PrivilegedExceptionAction[FileSinkOperator.RecordWriter] {
+        def run: FileSinkOperator.RecordWriter = HiveFileFormatUtils.getHiveRecordWriter(
+          conf.value,
+          fileSinkConf.getTableInfo,
+          conf.value.getOutputValueClass.asInstanceOf[Class[Writable]],
+          fileSinkConf,
+          FileOutputFormat.getTaskOutputPath(conf.value, getOutputName),
+          Reporter.NULL)
+      })
+    } else {
+      writer = HiveFileFormatUtils.getHiveRecordWriter(
+        conf.value,
+        fileSinkConf.getTableInfo,
+        conf.value.getOutputValueClass.asInstanceOf[Class[Writable]],
+        fileSinkConf,
+        FileOutputFormat.getTaskOutputPath(conf.value, getOutputName),
+        Reporter.NULL)
+    }
   }
 
   protected def commit() {
@@ -234,13 +252,26 @@ private[spark] class SparkHiveDynamicPartitionWriterContainer(
         new Path(workPath, getOutputName)
       }
 
-      HiveFileFormatUtils.getHiveRecordWriter(
-        conf.value,
-        fileSinkConf.getTableInfo,
-        conf.value.getOutputValueClass.asInstanceOf[Class[Writable]],
-        newFileSinkDesc,
-        path,
-        Reporter.NULL)
+      if (doAs) {
+        val ugi = UserGroupInformation.createRemoteUser(user)
+        ugi.doAs(new PrivilegedExceptionAction[FileSinkOperator.RecordWriter] {
+          def run: FileSinkOperator.RecordWriter = HiveFileFormatUtils.getHiveRecordWriter(
+            conf.value,
+            fileSinkConf.getTableInfo,
+            conf.value.getOutputValueClass.asInstanceOf[Class[Writable]],
+            newFileSinkDesc,
+            path,
+            Reporter.NULL)
+        })
+      } else {
+        HiveFileFormatUtils.getHiveRecordWriter(
+          conf.value,
+          fileSinkConf.getTableInfo,
+          conf.value.getOutputValueClass.asInstanceOf[Class[Writable]],
+          newFileSinkDesc,
+          path,
+          Reporter.NULL)
+      }
     }
 
     writers.getOrElseUpdate(dynamicPartPath, newWriter())
